@@ -205,13 +205,13 @@ def _collate_field(
 def _field_role(name: str, tensor: torch.Tensor) -> Optional[str]:
     if tensor.ndim == 0:
         return None
-    if name in TOKEN_PAIR_FIELDS:
+    if name in TOKEN_PAIR_FIELDS and tensor.ndim >= 2:
         return "token_pair"
-    if name in ATOM_PAIR_FIELDS:
+    if name in ATOM_PAIR_FIELDS and tensor.ndim >= 2:
         return "atom_pair"
-    if name in MSA_TOKEN_FIELDS:
+    if name in MSA_TOKEN_FIELDS and tensor.ndim >= 2:
         return "msa_token"
-    if name in ATOM_SET_FIELDS:
+    if name in ATOM_SET_FIELDS and tensor.ndim >= 2:
         return "atom_set"
     if name in TOKEN_FIELDS:
         return "token"

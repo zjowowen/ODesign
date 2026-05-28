@@ -181,3 +181,19 @@ def test_padded_collate_collates_basic_metadata_and_optional_fields() -> None:
         {"A": "protein", "id": "long"},
     ]
     assert basic["chain_id"] == [["A", "B"], ["A", "B"]]
+
+
+def test_padded_collate_handles_one_dimensional_msa_token_mask() -> None:
+    short = _sample(num_token=2, num_atom=3, num_msa=1, offset=1, pdb_id="short")
+    long = _sample(num_token=4, num_atom=5, num_msa=3, offset=7, pdb_id="long")
+
+    short["feature_data"].msa_token_mask = torch.tensor([True, False])
+    long["feature_data"].msa_token_mask = torch.tensor([False, True, True, False])
+
+    batch = collate_fn_odesign_padded([short, long])
+
+    assert batch["feature_data"].msa_token_mask.shape == (2, 4)
+    assert batch["feature_data"].msa_token_mask.tolist() == [
+        [True, False, False, False],
+        [False, True, True, False],
+    ]

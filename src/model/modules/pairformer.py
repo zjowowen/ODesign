@@ -31,6 +31,56 @@ from src.utils.openfold_local.utils.checkpointing import (
 )
 from src.api.model_interface import PairFormerInput
 
+
+def _apply_msa_token_mask(msa: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Zero MSA features at masked token positions, broadcasting over MSA rows."""
+    mask = mask.bool()
+    if mask.shape[-1] != msa.shape[-2]:
+        raise ValueError(
+            "msa_token_mask must end with the token dimension: "
+            f"mask shape {tuple(mask.shape)}, msa shape {tuple(msa.shape)}"
+        )
+
+    if mask.shape == msa.shape[:-1]:
+        expanded_mask = mask.unsqueeze(-1)
+    else:
+        expanded_mask = mask.unsqueeze(-2).unsqueeze(-1)
+        while expanded_mask.ndim < msa.ndim:
+            expanded_mask = expanded_mask.unsqueeze(0)
+
+    try:
+        return msa.masked_fill_(expanded_mask, 0)
+    except RuntimeError as exc:
+        raise ValueError(
+            "msa_token_mask is not broadcastable to MSA features: "
+            f"mask shape {tuple(mask.shape)}, msa shape {tuple(msa.shape)}"
+        ) from exc
+
+
+def _add_single_embedding_to_msa(
+    msa_sample: torch.Tensor, single_embedding: torch.Tensor
+) -> torch.Tensor:
+    """Add per-token single embeddings to every sampled MSA row."""
+    return msa_sample + single_embedding.unsqueeze(-3)
+
+
+def _slice_msa_rows(msa: torch.Tensor, row_count: int) -> torch.Tensor:
+    """Slice the MSA row axis while preserving leading batch dimensions."""
+    return msa.narrow(dim=-3, start=0, length=row_count)
+
+
+def _chunk_msa_rows(msa: torch.Tensor, chunk_size: int) -> list[torch.Tensor]:
+    """Split the MSA row axis into fixed-length chunks."""
+    dim_size = msa.size(-3)
+    chunk_num = (dim_size + chunk_size - 1) // chunk_size
+    chunks = []
+    for i in range(chunk_num):
+        start = i * chunk_size
+        end = min(start + chunk_size, dim_size)
+        chunks.append(msa.narrow(dim=-3, start=start, length=end - start))
+    return chunks
+
+
 @register_license('bytedance2024')
 class PairformerBlock(nn.Module):
     """
@@ -598,18 +648,18 @@ class MSAStack(nn.Module):
             m_new = pad_at_dim(
                 m, dim=-3, pad_length=(0, self.msa_max_size - m.shape[-3]), value=0
             )
-            assert (m_new[: m.shape[-3], :, :] == m).all()
+            assert (_slice_msa_rows(m_new, m.shape[-3]) == m).all()
             msa_pair_weighted = self.chunk_forward(
                 self.msa_pair_weighted_averaging, m_new, z, chunk_size
             )
-            m = m + self.dropout_row(msa_pair_weighted[: m.shape[-3], :, :])
+            m = m + self.dropout_row(_slice_msa_rows(msa_pair_weighted, m.shape[-3]))
             m_new = pad_at_dim(
                 m, dim=-3, pad_length=(0, self.msa_max_size - m.shape[-3]), value=0
             )
             m_transition = self.chunk_forward(
                 self.transition_m, m_new, None, chunk_size
             )
-            m = m + m_transition[: m.shape[-3], :, :]
+            m = m + _slice_msa_rows(m_transition, m.shape[-3])
             if (not self.training) and (z.shape[-2] > 2000 or m.shape[-3] > 5120):
                 del msa_pair_weighted, m_transition
                 torch.cuda.empty_cache()
@@ -645,23 +695,10 @@ class MSAStack(nn.Module):
                 Shape: [..., N_msa_sampled, N_token, c_m]
         """
 
-        def fixed_length_chunk(m, chunk_length, dim=0):
-            dim_size = m.size(dim)
-            chunk_num = (dim_size + chunk_length - 1) // chunk_length
-            chunks = []
-
-            for i in range(chunk_num):
-                start = i * chunk_length
-                end = min(start + chunk_length, dim_size)
-                chunk = m.narrow(dim, start, end - start)
-                chunks.append(chunk)
-
-            return chunks
-
         checkpoint_fn = get_checkpoint_fn()
         # Split the tensor `m` into chunks along the first dimension
         # m_chunks = torch.chunk(m, chunk_size, dim=0)
-        m_chunks = fixed_length_chunk(m, chunk_size, dim=0)
+        m_chunks = _chunk_msa_rows(m, chunk_size)
 
         # Process each chunk with gradient checkpointing
         if z is not None:
@@ -672,7 +709,7 @@ class MSAStack(nn.Module):
             del m_chunks
             torch.cuda.empty_cache()
         # Concatenate the processed chunks back together
-        m = torch.cat(processed_chunks, dim=0)
+        m = torch.cat(processed_chunks, dim=-3)
         if (not self.training) and m.shape[-3] > 5120:
             del processed_chunks
             torch.cuda.empty_cache()
@@ -1129,7 +1166,9 @@ class MSAModule(nn.Module):
             )
 
         if input_feature.msa_token_mask is not None:
-            msa_feat["msa"][..., input_feature['msa_token_mask'], :] = 0
+            msa_feat["msa"] = _apply_msa_token_mask(
+                msa_feat["msa"], input_feature["msa_token_mask"]
+            )
             
         target_shape = msa_feat["msa"].shape[:-1]
         msa_sample = torch.cat(
@@ -1149,7 +1188,9 @@ class MSAModule(nn.Module):
         msa_sample = self.linear_no_bias_m(msa_sample)
 
         # Auto broadcast [...,n_msa_sampled, n_token, c_m]
-        msa_sample = msa_sample + self.linear_no_bias_s(s_inputs)
+        msa_sample = _add_single_embedding_to_msa(
+            msa_sample, self.linear_no_bias_s(s_inputs)
+        )
         if z.shape[-2] > 2000 and (not self.training):
             clear_cache_between_blocks = True
         else:
