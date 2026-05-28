@@ -47,7 +47,7 @@ def centre_random_augmentation(
         )
     else:
         x_center = ((x_input_coords * mask.unsqueeze(dim=-1)).sum(dim=-2) / (
-            mask.sum(dim=-1) + eps
+            mask.sum(dim=-1, keepdim=True) + eps
         )).unsqueeze(dim=-2)
 
     x_input_coords = x_input_coords - x_center 
@@ -251,7 +251,17 @@ def broadcast_token_to_atom(
         # shape = [N_atom], easy index
         return x_token[..., atom_to_token_idx, :]
     else:
-        assert atom_to_token_idx.shape[:-1] == x_token.shape[:-2]
+        token_prefix = x_token.shape[:-2]
+        index_prefix = atom_to_token_idx.shape[:-1]
+        assert token_prefix[: len(index_prefix)] == index_prefix
+
+        missing_prefix = token_prefix[len(index_prefix):]
+        if missing_prefix:
+            atom_to_token_idx = atom_to_token_idx.reshape(
+                *index_prefix,
+                *((1,) * len(missing_prefix)),
+                atom_to_token_idx.size(-1),
+            ).expand(*token_prefix, atom_to_token_idx.size(-1))
 
     return batched_gather(
         data=x_token,
@@ -282,6 +292,18 @@ def aggregate_atom_to_token(
         torch.Tensor: token-level embedding
             [..., N_token, d]
     """
+    if atom_to_token_idx.dim() > 1:
+        atom_prefix = x_atom.shape[:-2]
+        index_prefix = atom_to_token_idx.shape[:-1]
+        assert atom_prefix[: len(index_prefix)] == index_prefix
+
+        missing_prefix = atom_prefix[len(index_prefix):]
+        if missing_prefix:
+            atom_to_token_idx = atom_to_token_idx.reshape(
+                *index_prefix,
+                *((1,) * len(missing_prefix)),
+                atom_to_token_idx.size(-1),
+            ).expand(*atom_prefix, atom_to_token_idx.size(-1))
 
     # Broadcasting in the given dim.
     out = scatter(

@@ -946,20 +946,64 @@ def gather_pair_embedding_in_dense_trunk(
     """
     idx_q = idx_q.long()
     idx_k = idx_k.long()
-    assert len(idx_q.shape) == len(idx_k.shape) == 2
+    if idx_q.dim() < 2 or idx_k.dim() < 2:
+        raise ValueError("idx_q and idx_k must include block and local dimensions.")
+    if idx_q.shape[:-2] != idx_k.shape[:-2] or idx_q.shape[-2] != idx_k.shape[-2]:
+        raise ValueError(
+            "idx_q and idx_k must have matching batch/block prefixes."
+        )
 
-    # Get the shape parameters
-    N_b, N_q = idx_q.shape
-    N_k = idx_k.shape[1]
+    x_prefix = x.shape[:-3]
+    idx_prefix = idx_q.shape[:-2]
+    if x_prefix[: len(idx_prefix)] != idx_prefix:
+        raise ValueError(
+            "Pair embedding prefix must start with the index prefix: "
+            f"{x_prefix} vs {idx_prefix}."
+        )
 
-    # Expand idx_q and idx_k to match the shape required for advanced indexing
-    idx_q_expanded = idx_q.unsqueeze(-1).expand(-1, -1, N_k)
-    idx_k_expanded = idx_k.unsqueeze(1).expand(-1, N_q, -1)
+    missing_prefix = x_prefix[len(idx_prefix):]
+    if missing_prefix:
+        idx_q = idx_q.reshape(
+            *idx_prefix,
+            *((1,) * len(missing_prefix)),
+            *idx_q.shape[-2:],
+        ).expand(*x_prefix, *idx_q.shape[-2:])
+        idx_k = idx_k.reshape(
+            *idx_prefix,
+            *((1,) * len(missing_prefix)),
+            *idx_k.shape[-2:],
+        ).expand(*x_prefix, *idx_k.shape[-2:])
+    elif idx_prefix != x_prefix:
+        raise ValueError(
+            "Index prefix must match or be expandable to the pair embedding prefix: "
+            f"{idx_prefix} vs {x_prefix}."
+        )
 
-    # Use advanced indexing to gather the desired elements
-    y = x[..., idx_q_expanded, idx_k_expanded, :]
+    n_token = x.size(-3)
+    n_blocks, n_q = idx_q.shape[-2:]
+    n_k = idx_k.shape[-1]
 
-    return y
+    flat_prefix = int(math.prod(x_prefix)) if x_prefix else 1
+    x_flat = x.reshape(flat_prefix, n_token, n_token, x.size(-1))
+    idx_q_flat = idx_q.reshape(flat_prefix, n_blocks, n_q)
+    idx_k_flat = idx_k.reshape(flat_prefix, n_blocks, n_k)
+
+    pair_offsets = (
+        torch.arange(flat_prefix, device=x.device)
+        .reshape(flat_prefix, 1, 1, 1)
+        * n_token
+        * n_token
+    )
+    flat_pair_indices = (
+        pair_offsets
+        + idx_q_flat.unsqueeze(-1) * n_token
+        + idx_k_flat.unsqueeze(-2)
+    )
+    y = x_flat.reshape(flat_prefix * n_token * n_token, x.size(-1))[
+        flat_pair_indices.reshape(-1)
+    ]
+
+    return y.reshape(*x_prefix, n_blocks, n_q, n_k, x.size(-1))
 
 
 def broadcast_token_to_local_atom_pair(

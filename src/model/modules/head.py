@@ -80,8 +80,11 @@ class BondTypeHead(nn.Module):
             torch.Tensor: bond type probability distribution
                 [*, N_token, N_token, no_bond_types]
         """
+        if z.ndim == 3:
+            z = z.unsqueeze(0)
+
         # [*, N_token, N_token, no_bond_types]
-        logits = self.classifier(z.unsqueeze(0))
+        logits = self.classifier(z)
         return logits
 
 @register_license('odesign2025')

@@ -10,7 +10,7 @@ accessors for data dimensions.
 """
 
 from ._base import *
-from typing import List
+from typing import List, Optional
 from attr import define
 import attr
 import numpy as np
@@ -255,7 +255,7 @@ class OFeatureData(DictAccessMixin):
     mol_id: IndexType
     mol_atom_index: IndexType
     entity_mol_id: IndexType
-    masked_asym_ids: List[int] | None = None
+    masked_asym_ids: Optional[List[int]] = None
 
     # Atom permutation features
     atom_perm_list: list[list[int]]
@@ -269,30 +269,34 @@ class OFeatureData(DictAccessMixin):
     bond_mask: MaskType
 
     # Constraint features
-    constraint_feature: FeatureType | None = None
+    constraint_feature: Optional[FeatureType] = None
 
     # MSA features (optional)
-    msa: IndexType | None = None
-    has_deletion: MaskType | None = None
-    deletion_value: FeatureType | None = None
-    profile: FeatureType | None = None
-    deletion_mean: FeatureType | None = None
-    msa_token_mask: MaskType | None = None
-    prot_pair_num_alignments: torch.Tensor | None = None
-    prot_unpair_num_alignments: torch.Tensor | None = None
-    rna_pair_num_alignments: torch.Tensor | None = None
-    rna_unpair_num_alignments: torch.Tensor | None = None
+    msa: Optional[IndexType] = None
+    has_deletion: Optional[MaskType] = None
+    deletion_value: Optional[FeatureType] = None
+    profile: Optional[FeatureType] = None
+    deletion_mean: Optional[FeatureType] = None
+    msa_token_mask: Optional[MaskType] = None
+    prot_pair_num_alignments: Optional[torch.Tensor] = None
+    prot_unpair_num_alignments: Optional[torch.Tensor] = None
+    rna_pair_num_alignments: Optional[torch.Tensor] = None
+    rna_unpair_num_alignments: Optional[torch.Tensor] = None
 
     # Template features (under development)
-    template_restype: IndexType | None = None
-    template_all_atom_mask: MaskType | None = None
-    template_all_atom_positions: FeatureType | None = None
+    template_restype: Optional[IndexType] = None
+    template_all_atom_mask: Optional[MaskType] = None
+    template_all_atom_positions: Optional[FeatureType] = None
 
     # Hotspot features
-    is_hotspot_residue: FeatureType | None = None
+    is_hotspot_residue: Optional[FeatureType] = None
 
     # Cyclic structure features
-    is_cyclic_token: FeatureType | None = None
+    is_cyclic_token: Optional[FeatureType] = None
+
+    # Batch padding masks; True means padded/invalid.
+    token_padding_mask: Optional[MaskType] = None
+    atom_padding_mask: Optional[MaskType] = None
     
     @classmethod
     def from_feature_dict(cls, feature_dict: dict) -> "OFeatureData":
@@ -347,7 +351,7 @@ class OFeatureData(DictAccessMixin):
         Returns:
             int: Number of tokens (residues/nucleotides/ligand atoms).
         """
-        return self.token_index.shape[0]
+        return self.token_index.shape[-1]
     
     @property
     def num_atom(self) -> int:
@@ -357,7 +361,7 @@ class OFeatureData(DictAccessMixin):
         Returns:
             int: Total number of atoms.
         """
-        return self.atom_to_token_idx.shape[0]
+        return self.atom_to_token_idx.shape[-1]
     
     @property
     def num_msa(self) -> int:
@@ -460,19 +464,19 @@ class OLabelData(DictAccessMixin):
     coordinate: FeatureType
     coordinate_mask: MaskType
 
-    token_bond_type_label: FeatureType | None = None
-    ligand_bond_mask: MaskType | None = None
+    token_bond_type_label: Optional[FeatureType] = None
+    ligand_bond_mask: Optional[MaskType] = None
 
-    entity_mol_id: IndexType | None = None
-    mol_id: IndexType | None = None
-    mol_atom_index: IndexType | None = None
+    entity_mol_id: Optional[IndexType] = None
+    mol_id: Optional[IndexType] = None
+    mol_atom_index: Optional[IndexType] = None
 
-    pae_rep_atom_mask: MaskType | None = None
+    pae_rep_atom_mask: Optional[MaskType] = None
 
-    eval_type: np.ndarray | None = None
-    cluster_id: np.ndarray | None = None
-    chain_1_mask: MaskType | None = None
-    chain_2_mask: MaskType | None = None
+    eval_type: Optional[np.ndarray] = None
+    cluster_id: Optional[np.ndarray] = None
+    chain_1_mask: Optional[MaskType] = None
+    chain_2_mask: Optional[MaskType] = None
 
     @classmethod
     def from_label_dict(cls, label_dict: dict) -> "OLabelData":
