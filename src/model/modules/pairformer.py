@@ -736,16 +736,10 @@ class MSAStack(nn.Module):
             torch.Tensor: Updated MSA embedding (same object as input, modified inplace).
                 Shape: [..., N_msa_sampled, N_token, c_m]
         """
-        num_msa = m.shape[-3]
-        no_chunks = num_msa // chunk_size + (num_msa % chunk_size != 0)
-        for i in range(no_chunks):
-            start = i * chunk_size
-            end = min((i + 1) * chunk_size, num_msa)
+        for m_chunk in _chunk_msa_rows(m, chunk_size):
             # Use inplace to save memory
-            m[start:end, :, :] += self.msa_pair_weighted_averaging(
-                m[start:end, :, :], z
-            )
-            m[start:end, :, :] += self.transition_m(m[start:end, :, :])
+            m_chunk += self.msa_pair_weighted_averaging(m_chunk, z)
+            m_chunk += self.transition_m(m_chunk)
         return m
 
 @register_license('bytedance2024')

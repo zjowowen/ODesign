@@ -1,6 +1,7 @@
 import torch
 
 from src.model.modules.pairformer import (
+    MSAStack,
     _add_single_embedding_to_msa,
     _apply_msa_token_mask,
     _chunk_msa_rows,
@@ -54,3 +55,34 @@ def test_chunk_msa_rows_splits_negative_three_axis() -> None:
         (2, 1, 3, 4),
     ]
     assert torch.equal(torch.cat(chunks, dim=-3), msa)
+
+
+def test_msa_stack_inference_forward_chunks_msa_axis_with_batch_prefix() -> None:
+    pair_weighted_shapes: list[tuple[int, ...]] = []
+    transition_shapes: list[tuple[int, ...]] = []
+
+    class PairWeighted(torch.nn.Module):
+        def forward(self, m: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            pair_weighted_shapes.append(tuple(m.shape))
+            return torch.ones_like(m)
+
+    class Transition(torch.nn.Module):
+        def forward(self, m: torch.Tensor) -> torch.Tensor:
+            transition_shapes.append(tuple(m.shape))
+            return torch.full_like(m, 2)
+
+    stack = MSAStack(msa_chunk_size=2)
+    stack.msa_pair_weighted_averaging = PairWeighted()
+    stack.transition_m = Transition()
+    stack.eval()
+
+    msa = torch.zeros(2, 5, 3, 4)
+    pair = torch.zeros(2, 3, 3, 4)
+
+    result = stack.inference_forward(msa, pair, chunk_size=2)
+
+    assert result is msa
+    assert torch.equal(result, torch.full_like(msa, 3))
+    expected_chunk_shapes = [(2, 2, 3, 4), (2, 2, 3, 4), (2, 1, 3, 4)]
+    assert pair_weighted_shapes == expected_chunk_shapes
+    assert transition_shapes == expected_chunk_shapes
