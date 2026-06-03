@@ -127,6 +127,28 @@ def _apply_last_dim_mask(
     return tensor * expanded_mask.to(dtype=tensor.dtype)
 
 
+def _diffusion_condition_align_mask(
+    is_condition_atom: torch.Tensor,
+    atom_padding_mask: Optional[torch.Tensor] = None,
+    threshold: float = 0.3,
+) -> torch.Tensor:
+    condition_mask = is_condition_atom.bool()
+    if atom_padding_mask is None:
+        valid_atom_mask = torch.ones_like(condition_mask, dtype=torch.bool)
+    else:
+        valid_atom_mask = ~atom_padding_mask.bool()
+
+    condition_count = (condition_mask & valid_atom_mask).sum(dim=-1)
+    valid_count = valid_atom_mask.sum(dim=-1).clamp_min(1)
+    condition_fraction = condition_count / valid_count
+    use_condition_align = condition_fraction >= threshold
+    return torch.where(
+        use_condition_align.unsqueeze(dim=-1),
+        condition_mask,
+        torch.ones_like(condition_mask, dtype=torch.bool),
+    )
+
+
 def _broadcast_prefix(
     tensor: torch.Tensor,
     prefix_shape: torch.Size,
@@ -283,6 +305,8 @@ class SmoothLDDTLoss(nn.Module):
         self.reduction = reduction
 
     def _chunk_forward(self, pred_distance, true_distance, c_lm=None):
+        if c_lm is not None:
+            true_distance = true_distance.unsqueeze(dim=-3)
         dist_diff = torch.abs(pred_distance - true_distance)
         # For save cuda memory we use inplace op
         dist_diff_epsilon = 0
@@ -379,7 +403,47 @@ class SmoothLDDTLoss(nn.Module):
             torch.Tensor: the smooth lddt loss
                 [...] if reduction is None else []
         """
+        if lddt_mask.dim() > 2:
+            prefix_shape = lddt_mask.shape[:-2]
+            pred_coordinate = _broadcast_prefix(
+                pred_coordinate,
+                prefix_shape,
+                event_ndim=3,
+                name="pred_coordinate",
+            )
+            true_coordinate = _broadcast_prefix(
+                true_coordinate,
+                prefix_shape,
+                event_ndim=2,
+                name="true_coordinate",
+            )
+
+            flat_lddt_mask = lddt_mask.reshape(-1, *lddt_mask.shape[-2:])
+            flat_pred_coordinate = pred_coordinate.reshape(
+                -1, *pred_coordinate.shape[-3:]
+            )
+            flat_true_coordinate = true_coordinate.reshape(
+                -1, *true_coordinate.shape[-2:]
+            )
+            flat_losses = [
+                self.sparse_forward(
+                    pred_coordinate=flat_pred_coordinate[i],
+                    true_coordinate=flat_true_coordinate[i],
+                    lddt_mask=flat_lddt_mask[i],
+                    diffusion_chunk_size=diffusion_chunk_size,
+                )
+                for i in range(flat_lddt_mask.shape[0])
+            ]
+            stacked_losses = torch.stack(flat_losses).reshape(prefix_shape)
+            if self.reduction is None:
+                return stacked_losses
+            return loss_reduction(stacked_losses, method=self.reduction)
+
         lddt_indices = torch.nonzero(lddt_mask, as_tuple=True)
+        if lddt_indices[0].numel() == 0:
+            zero_loss = pred_coordinate.sum(dim=(-1, -2, -3)) * 0.0
+            return loss_reduction(zero_loss, method=self.reduction)
+
         true_coords_l = true_coordinate.index_select(-2, lddt_indices[0])
         true_coords_m = true_coordinate.index_select(-2, lddt_indices[1])
         true_distance_sparse_lm = torch.norm(true_coords_l - true_coords_m, p=2, dim=-1)
@@ -402,10 +466,16 @@ class SmoothLDDTLoss(nn.Module):
             )
             for i in range(no_chunks):
                 pred_coords_i_l = pred_coordinate[
-                    i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size, :, :
+                    ...,
+                    i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size,
+                    :,
+                    :,
                 ].index_select(-2, lddt_indices[0])
                 pred_coords_i_m = pred_coordinate[
-                    i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size, :, :
+                    ...,
+                    i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size,
+                    :,
+                    :,
                 ].index_select(-2, lddt_indices[1])
 
                 # \delta x_{lm} and \delta x_{lm}^{GT} in the Algorithm 27
@@ -462,18 +532,13 @@ class SmoothLDDTLoss(nn.Module):
                 N_sample % diffusion_chunk_size != 0
             )
             for i in range(no_chunks):
-                pred_distance_i = torch.cdist(
-                    pred_coordinate[
-                        i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size,
-                        :,
-                        :,
-                    ],
-                    pred_coordinate[
-                        i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size,
-                        :,
-                        :,
-                    ],
-                )
+                pred_coordinate_i = pred_coordinate[
+                    ...,
+                    i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size,
+                    :,
+                    :,
+                ]
+                pred_distance_i = torch.cdist(pred_coordinate_i, pred_coordinate_i)
                 lddt_i = checkpoint_fn(
                     self._chunk_forward,
                     pred_distance_i,
@@ -1006,6 +1071,11 @@ class MSELoss(nn.Module):
 
         # Apply coordinate_mask
         weight = weight * coordinate_mask  # [N_atom] or [..., N_atom]
+        align_weight = _apply_last_dim_mask(
+            weight,
+            align_mask,
+            name="align_mask",
+        )
         true_coordinate = true_coordinate * coordinate_mask.unsqueeze(dim=-1)
         pred_coordinate = pred_coordinate * coordinate_mask[..., None, :, None]
 
@@ -1016,6 +1086,9 @@ class MSELoss(nn.Module):
         if len(weight.shape) > 1:
             weight = expand_at_dim(
                 weight, dim=-2, n=N_sample
+            )  # [..., N_sample, N_atom]
+            align_weight = expand_at_dim(
+                align_weight, dim=-2, n=N_sample
             )  # [..., N_sample, N_atom]
 
         # Align GT coords to predicted coords
@@ -1029,7 +1102,7 @@ class MSELoss(nn.Module):
                 ),  # [..., N_sample, N_atom, 3]
 
 
-                atom_weight=weight.to(
+                atom_weight=align_weight.to(
                     torch.float32
                 ),  # [N_atom] or [..., N_sample, N_atom]
                 stop_gradient=True,
@@ -1174,11 +1247,7 @@ class MSELoss(nn.Module):
                 is_dna=is_dna,
                 is_rna=is_rna,
                 is_ligand=is_ligand,
-                align_mask=_apply_last_dim_mask(
-                    align_mask,
-                    not_condition_atom,
-                    name="not_condition_atom",
-                ),
+                align_mask=not_condition_atom,
             )
         gen_align_loss_wo_condition = self.calc_mse(
             pred_x=pred_coordinate,
@@ -1516,10 +1585,12 @@ class ODesignLoss(nn.Module):
         # 0.3 is empirical parameter
         if (
             set(self.configs.data_condition) & set(['diffusion'])
-        ) and (
-            loss_input.is_condition_atom.sum() / len(loss_input.is_condition_atom) >= 0.3
         ):
-            align_mask = loss_input.is_condition_atom
+            align_mask = _diffusion_condition_align_mask(
+                is_condition_atom=loss_input.is_condition_atom,
+                atom_padding_mask=loss_input.atom_padding_mask,
+                threshold=0.3,
+            )
         else:  
             align_mask = torch.ones_like(loss_input.is_condition_atom, dtype=torch.bool)
 

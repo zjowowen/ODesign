@@ -240,6 +240,21 @@ class ODesign(nn.Module):
         nn.init.zeros_(self.linear_no_bias_z_cycle.weight)
         nn.init.zeros_(self.linear_no_bias_s.weight)
 
+    @staticmethod
+    def _make_pair_mask(
+        input_data: PairFormerInput,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor | None:
+        token_padding_mask = getattr(input_data, "token_padding_mask", None)
+        if token_padding_mask is None:
+            return None
+
+        valid_token_mask = ~token_padding_mask.bool()
+        pair_mask = valid_token_mask[..., :, None] & valid_token_mask[..., None, :]
+        if dtype is not None:
+            pair_mask = pair_mask.to(dtype=dtype)
+        return pair_mask
+
     def get_pairformer_output(
         self,
         input_data: PairFormerInput,
@@ -309,6 +324,7 @@ class ODesign(nn.Module):
             z_init = z_init + self.linear_no_bias_token_bond(
                 input_data.token_bonds.unsqueeze(dim=-1)
             )
+        pair_mask = self._make_pair_mask(input_data, dtype=z_init.dtype)
         z = torch.zeros_like(z_init)
         s = torch.zeros_like(s_init)
 
@@ -323,7 +339,7 @@ class ODesign(nn.Module):
                         z += self.constraint_distogram_embedder(
                             input_data,
                             z,
-                            pair_mask=None,
+                            pair_mask=pair_mask,
                             use_memory_efficient_kernel=self.configs.model.use_memory_efficient_kernel,
                             use_deepspeed_evo_attention=self.configs.model.use_deepspeed_evo_attention
                             and deepspeed_evo_attention_condition_satisfy,
@@ -335,7 +351,7 @@ class ODesign(nn.Module):
                         input_data,
                         z,
                         s_inputs,
-                        pair_mask=None,
+                        pair_mask=pair_mask,
                         use_memory_efficient_kernel=self.configs.model.use_memory_efficient_kernel,
                         use_deepspeed_evo_attention=self.configs.model.use_deepspeed_evo_attention
                         and deepspeed_evo_attention_condition_satisfy,
@@ -348,7 +364,7 @@ class ODesign(nn.Module):
                         z = z + self.constraint_distogram_embedder(
                             input_data,
                             z,
-                            pair_mask=None,
+                            pair_mask=pair_mask,
                             use_memory_efficient_kernel=self.configs.model.use_memory_efficient_kernel,
                             use_deepspeed_evo_attention=self.configs.model.use_deepspeed_evo_attention
                             and deepspeed_evo_attention_condition_satisfy,
@@ -360,7 +376,7 @@ class ODesign(nn.Module):
                         input_data,
                         z,
                         s_inputs,
-                        pair_mask=None,
+                        pair_mask=pair_mask,
                         use_memory_efficient_kernel=self.configs.model.use_memory_efficient_kernel,
                         use_deepspeed_evo_attention=self.configs.model.use_deepspeed_evo_attention
                         and deepspeed_evo_attention_condition_satisfy,
@@ -372,7 +388,7 @@ class ODesign(nn.Module):
                 s, z = self.pairformer_stack(
                     s,
                     z,
-                    pair_mask=None,
+                    pair_mask=pair_mask,
                     use_memory_efficient_kernel=self.configs.model.use_memory_efficient_kernel,
                     use_deepspeed_evo_attention=self.configs.model.use_deepspeed_evo_attention
                     and deepspeed_evo_attention_condition_satisfy,

@@ -11,11 +11,16 @@ from src.model.modules.loss import (
     BondLoss,
     BondTypeLoss,
     DistogramLoss,
+    _diffusion_condition_align_mask,
+    MSELoss,
+    SmoothLDDTLoss,
     _apply_last_dim_mask,
     _apply_resolution_gate,
     _valid_resolution_mask,
 )
 from src.model.modules.primitives import gather_pair_embedding_in_dense_trunk
+from src.model.modules.pairformer import PairformerBlock
+from src.model.modules.transformer import AttentionPairBias, DiffusionTransformer
 from src.utils.permutation.permutation import (
     _crop_atom_prefix,
     _is_batched_structure_tensor,
@@ -310,6 +315,35 @@ def test_aggregate_atom_to_token_expands_batched_index_over_sample_dim() -> None
     ]
 
 
+def test_aggregate_atom_to_token_ignores_masked_atoms_in_mean() -> None:
+    atom = torch.tensor(
+        [
+            [
+                [[1.0], [10.0], [3.0], [100.0]],
+                [[5.0], [20.0], [7.0], [200.0]],
+            ]
+        ]
+    )
+    atom_to_token_idx = torch.tensor([[0, 1, 0, 0]])
+    atom_mask = torch.tensor([[True, True, True, False]])
+
+    token = aggregate_atom_to_token(
+        atom,
+        atom_to_token_idx=atom_to_token_idx,
+        atom_mask=atom_mask,
+        n_token=2,
+        reduce="mean",
+    )
+
+    assert token.shape == (1, 2, 2, 1)
+    assert token.tolist() == [
+        [
+            [[2.0], [10.0]],
+            [[6.0], [20.0]],
+        ]
+    ]
+
+
 def test_gather_pair_embedding_in_dense_trunk_expands_batched_indices_over_sample_dim() -> None:
     z_token = torch.arange(2 * 2 * 3 * 3, dtype=torch.float32).reshape(
         2, 2, 3, 3, 1
@@ -350,6 +384,146 @@ def test_gather_pair_embedding_in_dense_trunk_expands_batched_indices_over_sampl
         [32.0, 30.0, 31.0],
         [35.0, 33.0, 34.0],
     ]
+
+
+def test_attention_pair_bias_applies_standard_attention_mask() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("AttentionPairBias uses fused LayerNorm in the H CUDA runtime.")
+    device = torch.device("cuda")
+    captured = {}
+
+    class CaptureAttention(torch.nn.Module):
+        def forward(self, q_x, kv_x, *, attn_bias=None, **kwargs):
+            del kv_x, kwargs
+            captured["attn_bias"] = attn_bias
+            return torch.zeros_like(q_x)
+
+    module = AttentionPairBias(has_s=False, n_heads=1, c_a=4, c_z=2).to(device)
+    module.attention = CaptureAttention()
+    attn_mask = torch.tensor(
+        [
+            [True, True, False],
+            [True, True, False],
+            [False, False, False],
+        ],
+        device=device,
+    )
+
+    module(
+        a=torch.zeros(3, 4, device=device),
+        s=None,
+        z=torch.zeros(3, 3, 2, device=device),
+        attn_mask=attn_mask,
+    )
+
+    attn_bias = captured["attn_bias"]
+    assert attn_bias.shape == (1, 3, 3)
+    assert torch.all(attn_bias[..., :2, :2] == 0)
+    assert torch.all(attn_bias[..., :2, 2] < -1e9)
+
+
+def test_diffusion_transformer_mask_blocks_padded_token_gradients() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("DiffusionTransformer uses fused LayerNorm in the H CUDA runtime.")
+    device = torch.device("cuda")
+    torch.manual_seed(7)
+    transformer = DiffusionTransformer(
+        c_a=4,
+        c_s=4,
+        c_z=2,
+        n_blocks=1,
+        n_heads=1,
+    ).to(device)
+    transformer.train()
+
+    a = torch.randn(1, 3, 4, device=device, requires_grad=True)
+    s = torch.randn(1, 3, 4, device=device)
+    z = torch.randn(1, 3, 3, 2, device=device)
+    attn_mask = torch.tensor(
+        [
+            [
+                [True, True, False],
+                [True, True, False],
+                [False, False, False],
+            ]
+        ],
+        device=device,
+    )
+
+    out = transformer(a=a, s=s, z=z, attn_mask=attn_mask)
+    out[:, :2].sum().backward()
+
+    assert torch.allclose(a.grad[:, 2], torch.zeros_like(a.grad[:, 2]), atol=1e-7)
+
+
+def test_pairformer_block_passes_pair_mask_to_single_attention() -> None:
+    captured = {}
+
+    class ZeroLike(torch.nn.Module):
+        def forward(self, x, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(x)
+
+    class CapturePairBias(torch.nn.Module):
+        def forward(self, *, a, s, z, attn_mask=None, **kwargs):
+            del s, z, kwargs
+            captured["attn_mask"] = attn_mask
+            return torch.zeros_like(a)
+
+    block = PairformerBlock(c_s=4, c_z=2, n_heads=1, dropout=0.0)
+    block.tri_mul_out = ZeroLike()
+    block.tri_mul_in = ZeroLike()
+    block.tri_att_start = ZeroLike()
+    block.tri_att_end = ZeroLike()
+    block.pair_transition = ZeroLike()
+    block.single_transition = ZeroLike()
+    block.dropout_row = torch.nn.Identity()
+    block.attention_pair_bias = CapturePairBias()
+    pair_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+
+    block(
+        s=torch.zeros(3, 4),
+        z=torch.zeros(3, 3, 2),
+        pair_mask=pair_mask,
+    )
+
+    assert torch.equal(captured["attn_mask"], pair_mask)
+
+
+def test_diffusion_transformer_passes_token_attention_mask_to_blocks() -> None:
+    captured = {}
+
+    class CaptureBlock(torch.nn.Module):
+        def forward(self, a, s, z, *, attn_mask=None, **kwargs):
+            del kwargs
+            captured["attn_mask"] = attn_mask
+            return a, s, z
+
+    transformer = DiffusionTransformer(c_a=4, c_s=4, c_z=2, n_blocks=1, n_heads=1)
+    transformer.blocks = torch.nn.ModuleList([CaptureBlock()])
+    transformer.blocks_per_ckpt = None
+    attn_mask = torch.tensor(
+        [
+            [True, True, False],
+            [True, True, False],
+            [False, False, False],
+        ]
+    )
+
+    transformer(
+        a=torch.zeros(3, 4),
+        s=torch.zeros(3, 4),
+        z=torch.zeros(3, 3, 2),
+        attn_mask=attn_mask,
+    )
+
+    assert torch.equal(captured["attn_mask"], attn_mask)
 
 
 def test_valid_resolution_mask_vectorizes_per_example() -> None:
@@ -587,6 +761,384 @@ def test_sparse_bond_loss_returns_batched_differentiable_zero_without_bonds() ->
     assert loss.shape == (2,)
     assert loss.requires_grad
     assert torch.equal(loss, torch.zeros(2))
+
+
+def test_sparse_smooth_lddt_loss_preserves_batched_pair_indices() -> None:
+    loss_fn = SmoothLDDTLoss(reduction=None)
+    true_coordinate = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+        ]
+    )
+    pred_coordinate = torch.tensor(
+        [
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.5, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            ],
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [4.5, 0.0, 0.0],
+                ]
+            ],
+        ]
+    )
+    lddt_mask = torch.zeros(2, 3, 3, dtype=torch.bool)
+    lddt_mask[0, 0, 1] = True
+    lddt_mask[1, 1, 2] = True
+
+    batched_loss = loss_fn.sparse_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+    )
+    expected_loss = torch.stack(
+        [
+            loss_fn.sparse_forward(
+                pred_coordinate=pred_coordinate[i],
+                true_coordinate=true_coordinate[i],
+                lddt_mask=lddt_mask[i],
+            )
+            for i in range(2)
+        ]
+    )
+
+    assert batched_loss.shape == (2,)
+    assert torch.allclose(batched_loss, expected_loss)
+
+
+def test_sparse_smooth_lddt_loss_reduces_batched_prefix_with_mean_reduction() -> None:
+    per_example_loss_fn = SmoothLDDTLoss(reduction=None)
+    mean_loss_fn = SmoothLDDTLoss(reduction="mean")
+    true_coordinate = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+        ]
+    )
+    pred_coordinate = torch.tensor(
+        [
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.5, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            ],
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [4.5, 0.0, 0.0],
+                ]
+            ],
+        ]
+    )
+    lddt_mask = torch.zeros(2, 3, 3, dtype=torch.bool)
+    lddt_mask[0, 0, 1] = True
+    lddt_mask[1, 1, 2] = True
+
+    per_example_loss = per_example_loss_fn.sparse_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+    )
+    mean_loss = mean_loss_fn.sparse_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+    )
+
+    assert mean_loss.shape == torch.Size([])
+    assert torch.allclose(mean_loss, per_example_loss.mean())
+
+
+def test_sparse_smooth_lddt_chunk_slices_sample_axis_with_shared_mask() -> None:
+    loss_fn = SmoothLDDTLoss(reduction=None)
+    true_coordinate = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ]
+    )
+    pred_coordinate = torch.tensor(
+        [
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.5, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                ],
+            ],
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [3.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [4.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [1.5, 0.0, 0.0],
+                ],
+            ],
+        ]
+    )
+    lddt_mask = torch.zeros(3, 3, dtype=torch.bool)
+    lddt_mask[0, 1] = True
+    lddt_mask[1, 2] = True
+
+    unchunked_loss = loss_fn.sparse_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+    )
+    chunked_loss = loss_fn.sparse_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+        diffusion_chunk_size=2,
+    )
+
+    assert chunked_loss.shape == (2,)
+    assert torch.allclose(chunked_loss, unchunked_loss)
+
+
+def test_sparse_smooth_lddt_empty_mask_returns_differentiable_zero() -> None:
+    loss_fn = SmoothLDDTLoss(reduction=None)
+    pred_coordinate = torch.zeros(2, 3, 4, 3, requires_grad=True)
+
+    loss = loss_fn.sparse_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=torch.zeros(2, 4, 3),
+        lddt_mask=torch.zeros(4, 4, dtype=torch.bool),
+    )
+
+    assert loss.shape == (2,)
+    assert loss.requires_grad
+    assert torch.equal(loss, torch.zeros(2))
+
+
+def test_dense_smooth_lddt_loss_preserves_batched_diffusion_sample_axis() -> None:
+    loss_fn = SmoothLDDTLoss(reduction=None)
+    true_coordinate = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+        ]
+    )
+    pred_coordinate = torch.tensor(
+        [
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.5, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+            ],
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [4.5, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [3.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [1.5, 0.0, 0.0],
+                ],
+            ],
+        ]
+    )
+    lddt_mask = torch.zeros(2, 3, 3, dtype=torch.bool)
+    lddt_mask[0, 0, 1] = True
+    lddt_mask[1, 1, 2] = True
+
+    batched_loss = loss_fn.dense_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+        diffusion_chunk_size=2,
+    )
+    expected_loss = torch.stack(
+        [
+            loss_fn.dense_forward(
+                pred_coordinate=pred_coordinate[i],
+                true_coordinate=true_coordinate[i],
+                lddt_mask=lddt_mask[i],
+                diffusion_chunk_size=2,
+            )
+            for i in range(2)
+        ]
+    )
+
+    assert batched_loss.shape == (2,)
+    assert torch.allclose(batched_loss, expected_loss)
+
+
+def test_dense_smooth_lddt_chunk_supports_real_training_sample_count() -> None:
+    loss_fn = SmoothLDDTLoss(reduction=None)
+    true_coordinate = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 0.0, 2.0],
+            ],
+        ]
+    )
+    pred_coordinate = true_coordinate[:, None, :, :].expand(2, 48, 3, 3).clone()
+    sample_offsets = torch.linspace(0.0, 0.47, steps=48).view(1, 48, 1, 1)
+    pred_coordinate = pred_coordinate + sample_offsets
+    pred_coordinate[0, :, 1, 0] += torch.linspace(0.0, 0.3, steps=48)
+    pred_coordinate[1, :, 2, 2] -= torch.linspace(0.0, 0.5, steps=48)
+
+    lddt_mask = torch.zeros(2, 3, 3, dtype=torch.bool)
+    lddt_mask[0, 0, 1] = True
+    lddt_mask[0, 1, 2] = True
+    lddt_mask[1, 0, 2] = True
+    lddt_mask[1, 1, 2] = True
+
+    unchunked_loss = loss_fn.dense_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+    )
+    chunked_loss = loss_fn.dense_forward(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        lddt_mask=lddt_mask,
+        diffusion_chunk_size=48,
+    )
+
+    assert chunked_loss.shape == (2,)
+    assert torch.allclose(chunked_loss, unchunked_loss)
+
+
+def test_diffusion_condition_align_mask_threshold_is_per_example_and_padding_aware() -> None:
+    is_condition_atom = torch.tensor(
+        [
+            [True, True, False, False],
+            [False, False, False, False],
+        ]
+    )
+    atom_padding_mask = torch.tensor(
+        [
+            [False, False, False, True],
+            [False, False, False, True],
+        ]
+    )
+
+    align_mask = _diffusion_condition_align_mask(
+        is_condition_atom=is_condition_atom,
+        atom_padding_mask=atom_padding_mask,
+        threshold=0.3,
+    )
+
+    assert align_mask.tolist() == [
+        [True, True, False, False],
+        [True, True, True, True],
+    ]
+
+
+def test_mse_weighted_rigid_align_uses_align_mask_for_alignment_weights() -> None:
+    loss_fn = MSELoss(reduction=None)
+    true_coordinate = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [50.0, 50.0, 50.0],
+        ]
+    )
+    translation = torch.tensor([10.0, 20.0, -3.0])
+    pred_coordinate = true_coordinate.clone()
+    pred_coordinate[:3] = true_coordinate[:3] + translation
+    pred_coordinate[3] = torch.tensor([-100.0, 25.0, 80.0])
+    pred_coordinate = pred_coordinate.unsqueeze(dim=0)
+
+    aligned, _ = loss_fn.weighted_rigid_align(
+        pred_coordinate=pred_coordinate,
+        true_coordinate=true_coordinate,
+        coordinate_mask=torch.ones(4),
+        is_dna=torch.zeros(4),
+        is_rna=torch.zeros(4),
+        is_ligand=torch.zeros(4),
+        align_mask=torch.tensor([True, True, True, False]),
+    )
+
+    assert torch.allclose(
+        aligned[0, :3],
+        pred_coordinate[0, :3],
+        atol=1e-4,
+        rtol=1e-4,
+    )
 
 
 def test_distogram_loss_accepts_batched_ragged_rep_atom_mask() -> None:

@@ -277,6 +277,7 @@ class PairformerBlock(nn.Module):
                 a=s,
                 s=None,
                 z=z,
+                attn_mask=pair_mask,
             )
             s = s + self.single_transition(s)
         return s, z

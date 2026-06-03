@@ -1,9 +1,12 @@
 import torch
 import attr
+import pytest
 from ml_collections.config_dict import ConfigDict
 
+from src.api.model_interface import PairFormerInput
 from src.api.data_interface import OFeatureData, OLabelData
 from src.model.odesign import ODesign
+from src.model.modules import generator as generator_module
 from src.model.modules.loss import ODesignLoss
 from src.utils.model.padded_collate import collate_fn_odesign_padded
 from src.utils.permutation.permutation import SymmetricPermutation
@@ -22,6 +25,103 @@ def _move_to_device(value, device: torch.device):
             }
         )
     return value
+
+
+def _append_dims(value: torch.Tensor, ndim: int) -> torch.Tensor:
+    while value.ndim < ndim:
+        value = value.unsqueeze(-1)
+    return value
+
+
+def _deterministic_centre_augmentation(
+    x_input_coords: torch.Tensor,
+    N_sample: int = 1,
+    s_trans: float = 1.0,
+    centre_only: bool = False,
+    mask: torch.Tensor | None = None,
+    eps: float = 1e-12,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del s_trans, centre_only
+    if mask is None:
+        x_center = x_input_coords.mean(dim=-2, keepdim=True)
+    else:
+        x_center = (
+            (x_input_coords * mask.unsqueeze(-1)).sum(dim=-2)
+            / (mask.sum(dim=-1, keepdim=True) + eps)
+        ).unsqueeze(-2)
+
+    centered = (x_input_coords - x_center).unsqueeze(-3)
+    centered = centered.expand(*centered.shape[:-3], N_sample, *centered.shape[-2:])
+    batch_prefix = centered.shape[:-3]
+    trans = torch.zeros(*batch_prefix, N_sample, 3, device=x_input_coords.device)
+    rot = (
+        torch.eye(3, device=x_input_coords.device)
+        .view(*([1] * len(batch_prefix)), 1, 3, 3)
+        .expand(*batch_prefix, N_sample, 3, 3)
+    )
+    return (
+        centered.to(dtype),
+        trans.to(dtype),
+        rot.to(dtype),
+        x_center.to(dtype),
+    )
+
+
+def _make_training_diffusion_deterministic(model: ODesign, sigma_value: float = 1.0) -> None:
+    scheduler = model.train_noise_schedulers["coordinate"]
+
+    def sample_noise_level(
+        size: torch.Size,
+        device: torch.device = torch.device("cpu"),
+    ) -> torch.Tensor:
+        return torch.full(size, sigma_value, device=device)
+
+    def add_noise_with_condition(
+        x_gt: torch.Tensor,
+        sigma: torch.Tensor,
+        condition_mask: torch.Tensor,
+        scale: bool = True,
+    ) -> torch.Tensor:
+        del condition_mask
+        if not scale:
+            return x_gt
+        sigma = _append_dims(sigma, x_gt.ndim)
+        c_in = 1 / torch.sqrt(scheduler.sigma_data**2 + sigma**2)
+        return c_in * x_gt
+
+    scheduler.sample_noise_level = sample_noise_level
+    scheduler.add_noise_with_condition = add_noise_with_condition
+
+
+def _forward_loss(
+    model: ODesign,
+    loss_fn: ODesignLoss,
+    symmetric_permutation: SymmetricPermutation,
+    batch: dict,
+) -> tuple:
+    model_output, ground_truth, loss_input = model.forward(
+        feature_data=batch["feature_data"],
+        label_full_data=batch["label_full_data"],
+        label_data=batch["label_data"],
+        mode="train",
+        current_step=0,
+        symmetric_permutation=symmetric_permutation,
+    )
+    loss, metrics = loss_fn(
+        loss_input=loss_input,
+        pred_output=model_output,
+        ground_truth=ground_truth,
+        mode="train",
+    )
+    return model_output, ground_truth, loss_input, loss, metrics
+
+
+def _named_grads(model: ODesign) -> dict[str, torch.Tensor | None]:
+    return {
+        name: None if param.grad is None else param.grad.detach().cpu().clone()
+        for name, param in model.named_parameters()
+    }
 
 
 def _tiny_configs() -> ConfigDict:
@@ -126,7 +226,7 @@ def _tiny_configs() -> ConfigDict:
                     "n_blocks": 0,
                 },
                 "pairformer": {
-                    "n_blocks": 0,
+                    "n_blocks": 1,
                     "n_heads": 1,
                     "c_s": 16,
                     "c_z": 8,
@@ -144,18 +244,18 @@ def _tiny_configs() -> ConfigDict:
                     "c_token": c_token,
                     "c_z": 8,
                     "atom_encoder": {
-                        "n_blocks": 0,
+                        "n_blocks": 1,
                         "n_heads": 1,
                         "n_queries": 2,
                         "n_keys": 4,
                     },
                     "transformer": {
-                        "n_blocks": 0,
+                        "n_blocks": 1,
                         "n_heads": 1,
                         "drop_path_rate": 0.0,
                     },
                     "atom_decoder": {
-                        "n_blocks": 0,
+                        "n_blocks": 1,
                         "n_heads": 1,
                         "n_queries": 2,
                         "n_keys": 4,
@@ -398,3 +498,188 @@ def test_padding_batch_train_forward_backward_smoke() -> None:
         parameter.grad is not None and torch.isfinite(parameter.grad).all().item()
         for parameter in model.parameters()
     )
+
+
+def test_pairformer_paths_receive_token_padding_pair_mask() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip(
+            "ODesign pairformer mask wiring test requires CUDA in the H runtime."
+        )
+    device = torch.device("cuda")
+    configs = _tiny_configs()
+    configs.data_condition = ["constraint_distogram"]
+
+    captures = {
+        "constraint": [],
+        "msa": [],
+        "pairformer": [],
+    }
+
+    class SpyConstraint(torch.nn.Module):
+        def forward(self, input_data, z, *, pair_mask=None, **kwargs):
+            del input_data, kwargs
+            captures["constraint"].append(pair_mask)
+            return torch.zeros_like(z)
+
+    class SpyMSA(torch.nn.Module):
+        def forward(self, input_data, z, s_inputs, *, pair_mask=None, **kwargs):
+            del input_data, s_inputs, kwargs
+            captures["msa"].append(pair_mask)
+            return z
+
+    class SpyPairformer(torch.nn.Module):
+        def forward(self, s, z, *, pair_mask=None, **kwargs):
+            del kwargs
+            captures["pairformer"].append(pair_mask)
+            return s, z
+
+    batch = collate_fn_odesign_padded(
+        [
+            _sample(3, 4, 1, 1, "short"),
+            _sample(5, 7, 1, 3, "long"),
+        ]
+    )
+    pairformer_input = _move_to_device(
+        PairFormerInput.from_feature_data(batch["feature_data"]),
+        device,
+    )
+
+    model = ODesign(configs).to(device)
+    model.constraint_distogram_embedder = SpyConstraint().to(device)
+    model.msa_module = SpyMSA().to(device)
+    model.pairformer_stack = SpyPairformer().to(device)
+
+    model.get_pairformer_output(pairformer_input, N_cycle=1)
+
+    valid_token_mask = ~pairformer_input.token_padding_mask.bool()
+    expected_pair_mask = (
+        valid_token_mask[..., :, None] & valid_token_mask[..., None, :]
+    )
+
+    for name, masks in captures.items():
+        assert len(masks) == 1, name
+        assert masks[0] is not None, name
+        assert torch.is_floating_point(masks[0]), name
+        assert torch.equal(masks[0].bool(), expected_pair_mask), name
+
+
+def test_padding_batch_matches_average_of_single_item_training_steps(monkeypatch) -> None:
+    torch.manual_seed(0)
+    if not torch.cuda.is_available():
+        pytest.skip(
+            "ODesign training equivalence test requires CUDA because the H image "
+            "uses fused LayerNorm kernels without a CPU fallback."
+        )
+    torch.cuda.manual_seed_all(0)
+    monkeypatch.setattr(
+        generator_module,
+        "centre_random_augmentation",
+        _deterministic_centre_augmentation,
+    )
+    device = torch.device("cuda")
+    configs = _tiny_configs()
+    symmetric_permutation = SymmetricPermutation(configs)
+
+    samples = [
+        _sample(3, 4, 1, 1, "short"),
+        _sample(5, 7, 1, 3, "long"),
+    ]
+    batch = _move_to_device(collate_fn_odesign_padded(samples), device)
+    single_batches = [
+        _move_to_device(collate_fn_odesign_padded([sample]), device)
+        for sample in samples
+    ]
+
+    torch.manual_seed(123)
+    batched_model = ODesign(configs).to(device)
+    micro_model = ODesign(configs).to(device)
+    micro_model.load_state_dict(batched_model.state_dict())
+    _make_training_diffusion_deterministic(batched_model)
+    _make_training_diffusion_deterministic(micro_model)
+    batched_model.train()
+    micro_model.train()
+
+    batched_loss_fn = ODesignLoss(configs)
+    micro_loss_fn = ODesignLoss(configs)
+
+    batched_output, batched_gt, batched_loss_input, batched_loss, batched_metrics = (
+        _forward_loss(batched_model, batched_loss_fn, symmetric_permutation, batch)
+    )
+    batched_loss.backward()
+    batched_grads = _named_grads(batched_model)
+
+    micro_outputs = []
+    micro_gts = []
+    micro_loss_inputs = []
+    micro_losses = []
+    micro_metrics = []
+    for single_batch in single_batches:
+        output, gt, loss_input, loss, metrics = _forward_loss(
+            micro_model,
+            micro_loss_fn,
+            symmetric_permutation,
+            single_batch,
+        )
+        micro_outputs.append(output)
+        micro_gts.append(gt)
+        micro_loss_inputs.append(loss_input)
+        micro_losses.append(loss)
+        micro_metrics.append(metrics)
+    micro_loss = torch.stack(micro_losses).mean()
+    micro_loss.backward()
+    micro_grads = _named_grads(micro_model)
+
+    assert torch.allclose(batched_loss, micro_loss, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(
+        batched_metrics["loss"],
+        torch.stack([metrics["loss"] for metrics in micro_metrics]).mean(),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+
+    token_lens = [3, 5]
+    atom_lens = [4, 7]
+    for idx, (num_token, num_atom) in enumerate(zip(token_lens, atom_lens)):
+        assert torch.allclose(
+            batched_gt.coordinate[idx, :num_atom],
+            micro_gts[idx].coordinate[0, :num_atom],
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        assert torch.equal(
+            batched_loss_input.atom_padding_mask[idx, :num_atom],
+            micro_loss_inputs[idx].atom_padding_mask[0, :num_atom],
+        )
+        assert torch.allclose(
+            batched_output["coordinate"][idx, :, :num_atom],
+            micro_outputs[idx]["coordinate"][0, :, :num_atom],
+            atol=2e-5,
+            rtol=2e-5,
+        )
+        assert torch.allclose(
+            batched_output["distogram"][idx, :num_token, :num_token],
+            micro_outputs[idx]["distogram"][0, :num_token, :num_token],
+            atol=2e-5,
+            rtol=2e-5,
+        )
+        assert torch.allclose(
+            batched_output["token_bond_type_logits"][idx, :num_token, :num_token],
+            micro_outputs[idx]["token_bond_type_logits"][0, :num_token, :num_token],
+            atol=2e-5,
+            rtol=2e-5,
+        )
+
+    compared_grads = 0
+    for name, batched_grad in batched_grads.items():
+        micro_grad = micro_grads[name]
+        if batched_grad is None or micro_grad is None:
+            assert batched_grad is None and micro_grad is None, name
+            continue
+        compared_grads += 1
+        assert torch.allclose(
+            batched_grad,
+            micro_grad,
+            atol=2e-5,
+            rtol=2e-5,
+        ), name
+    assert compared_grads > 0

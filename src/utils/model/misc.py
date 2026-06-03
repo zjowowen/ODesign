@@ -275,6 +275,7 @@ def broadcast_token_to_atom(
 def aggregate_atom_to_token(
     x_atom: torch.Tensor,
     atom_to_token_idx: torch.Tensor,
+    atom_mask: Optional[torch.Tensor] = None,
     n_token: Optional[int] = None,
     reduce: str = "mean",
 ) -> torch.Tensor:
@@ -285,6 +286,8 @@ def aggregate_atom_to_token(
             [..., N_atom, d]
         atom_to_token_idx (torch.Tensor): map atom to token idx
             [..., N_atom] or [N_atom]
+        atom_mask (torch.Tensor, optional): valid atom mask.
+            [..., N_atom] or [N_atom]. Masked atoms do not contribute.
         n_token (int, optional): number of tokens in total. Defaults to None.
         reduce (str, optional): aggregation method. Defaults to "mean".
 
@@ -304,6 +307,53 @@ def aggregate_atom_to_token(
                 *((1,) * len(missing_prefix)),
                 atom_to_token_idx.size(-1),
             ).expand(*atom_prefix, atom_to_token_idx.size(-1))
+
+    if atom_mask is not None:
+        if atom_mask.shape[-1] != x_atom.shape[-2]:
+            raise ValueError(
+                "atom_mask last dimension must match x_atom atom dimension: "
+                f"{tuple(atom_mask.shape)} vs {tuple(x_atom.shape)}"
+            )
+        atom_mask = atom_mask.to(device=x_atom.device, dtype=torch.bool)
+        if atom_mask.dim() == 1:
+            atom_mask = atom_mask.reshape(
+                *((1,) * len(x_atom.shape[:-2])),
+                atom_mask.size(-1),
+            ).expand(*x_atom.shape[:-2], atom_mask.size(-1))
+        else:
+            atom_prefix = x_atom.shape[:-2]
+            mask_prefix = atom_mask.shape[:-1]
+            assert atom_prefix[: len(mask_prefix)] == mask_prefix
+            missing_prefix = atom_prefix[len(mask_prefix):]
+            if missing_prefix:
+                atom_mask = atom_mask.reshape(
+                    *mask_prefix,
+                    *((1,) * len(missing_prefix)),
+                    atom_mask.size(-1),
+                ).expand(*atom_prefix, atom_mask.size(-1))
+
+        if reduce == "mean":
+            weighted_atom = x_atom * atom_mask.unsqueeze(-1).to(dtype=x_atom.dtype)
+            numerator = scatter(
+                src=weighted_atom,
+                index=atom_to_token_idx,
+                dim=-2,
+                dim_size=n_token,
+                reduce="sum",
+            )
+            denominator = scatter(
+                src=atom_mask.unsqueeze(-1).to(dtype=x_atom.dtype),
+                index=atom_to_token_idx,
+                dim=-2,
+                dim_size=n_token,
+                reduce="sum",
+            )
+            return numerator / denominator.clamp_min(1)
+
+        if reduce in ["sum", "add"]:
+            x_atom = x_atom * atom_mask.unsqueeze(-1).to(dtype=x_atom.dtype)
+        else:
+            raise ValueError(f"atom_mask is only supported for mean/sum/add, got {reduce}")
 
     # Broadcasting in the given dim.
     out = scatter(

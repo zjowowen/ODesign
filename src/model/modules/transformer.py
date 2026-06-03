@@ -114,6 +114,7 @@ class AttentionPairBias(nn.Module):
         z: torch.Tensor,
         n_queries: int = 32,
         n_keys: int = 128,
+        trunked_attn_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -147,6 +148,13 @@ class AttentionPairBias(nn.Module):
         bias = permute_final_dims(
             bias, [3, 0, 1, 2]
         )  # [..., n_heads, n_blocks, n_queries, n_keys]
+        if trunked_attn_mask is not None:
+            mask_bias = torch.zeros(
+                trunked_attn_mask.shape,
+                dtype=bias.dtype,
+                device=bias.device,
+            ).masked_fill(~trunked_attn_mask.bool(), -1e10)
+            bias = bias + mask_bias.unsqueeze(-4)
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(
@@ -165,6 +173,7 @@ class AttentionPairBias(nn.Module):
         q: torch.Tensor,
         kv: torch.Tensor,
         z: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
     ) -> torch.Tensor:
         """Used by Algorithm 7/20
@@ -186,6 +195,13 @@ class AttentionPairBias(nn.Module):
         # Multi-head attention bias
         bias = self.linear_nobias_z(self.layernorm_z(z))
         bias = permute_final_dims(bias, [2, 0, 1])  # [..., n_heads, N_token, N_token]
+        if attn_mask is not None:
+            mask_bias = torch.zeros(
+                attn_mask.shape,
+                dtype=bias.dtype,
+                device=bias.device,
+            ).masked_fill(~attn_mask.bool(), -1e10)
+            bias = bias + mask_bias.unsqueeze(dim=-3)
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
@@ -199,6 +215,8 @@ class AttentionPairBias(nn.Module):
         z: torch.Tensor,
         n_queries: Optional[int] = None,
         n_keys: Optional[int] = None,
+        trunked_attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -225,6 +243,7 @@ class AttentionPairBias(nn.Module):
                 z,
                 n_queries,
                 n_keys,
+                trunked_attn_mask=trunked_attn_mask,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
@@ -233,6 +252,7 @@ class AttentionPairBias(nn.Module):
                 a,
                 kv if self.cross_attention_mode else a,
                 z,
+                attn_mask=attn_mask,
                 inplace_safe=inplace_safe,
             )
 
@@ -297,6 +317,8 @@ class DiffusionTransformerBlock(nn.Module):
         z: torch.Tensor,
         n_queries: Optional[int] = None,
         n_keys: Optional[int] = None,
+        trunked_attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -324,6 +346,8 @@ class DiffusionTransformerBlock(nn.Module):
                 z=z,
                 n_queries=n_queries,
                 n_keys=n_keys,
+                trunked_attn_mask=trunked_attn_mask,
+                attn_mask=attn_mask,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
@@ -391,6 +415,8 @@ class DiffusionTransformer(nn.Module):
         self,
         n_queries: Optional[int] = None,
         n_keys: Optional[int] = None,
+        trunked_attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         clear_cache_between_blocks: bool = False,
@@ -400,6 +426,8 @@ class DiffusionTransformer(nn.Module):
                 b,
                 n_queries=n_queries,
                 n_keys=n_keys,
+                trunked_attn_mask=trunked_attn_mask,
+                attn_mask=attn_mask,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
@@ -421,6 +449,8 @@ class DiffusionTransformer(nn.Module):
         z: torch.Tensor,
         n_queries: Optional[int] = None,
         n_keys: Optional[int] = None,
+        trunked_attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -446,6 +476,8 @@ class DiffusionTransformer(nn.Module):
         blocks = self._prep_blocks(
             n_queries=n_queries,
             n_keys=n_keys,
+            trunked_attn_mask=trunked_attn_mask,
+            attn_mask=attn_mask,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
             clear_cache_between_blocks=clear_cache_between_blocks,
@@ -511,6 +543,7 @@ class AtomTransformer(nn.Module):
         q: torch.Tensor,
         c: torch.Tensor,
         p: torch.Tensor,
+        atom_mask: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -531,15 +564,59 @@ class AtomTransformer(nn.Module):
 
         assert n_queries == self.n_queries
         assert n_keys == self.n_keys
+        trunked_attn_mask = None
+        if atom_mask is not None:
+            atom_mask = self._expand_atom_mask(atom_mask, q)
+            _, key_mask_trunked, _ = rearrange_qk_to_dense_trunk(
+                q=atom_mask,
+                k=atom_mask,
+                dim_q=-1,
+                dim_k=-1,
+                n_queries=self.n_queries,
+                n_keys=self.n_keys,
+                compute_mask=False,
+            )
+            trunked_attn_mask = key_mask_trunked.unsqueeze(-2).expand(
+                *key_mask_trunked.shape[:-1],
+                self.n_queries,
+                key_mask_trunked.shape[-1],
+            )
         return self.diffusion_transformer(
             a=q,
             s=c,
             z=p,
             n_queries=self.n_queries,
             n_keys=self.n_keys,
+            trunked_attn_mask=trunked_attn_mask,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
+
+    @staticmethod
+    def _expand_atom_mask(atom_mask: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        if atom_mask.shape[-1] != q.shape[-2]:
+            raise ValueError(
+                "atom_mask last dimension must match q atom dimension: "
+                f"{tuple(atom_mask.shape)} vs {tuple(q.shape)}"
+            )
+        atom_mask = atom_mask.to(device=q.device, dtype=torch.bool)
+        if atom_mask.dim() == 1:
+            return atom_mask.reshape(
+                *((1,) * len(q.shape[:-2])),
+                atom_mask.size(-1),
+            ).expand(*q.shape[:-2], atom_mask.size(-1))
+
+        atom_prefix = q.shape[:-2]
+        mask_prefix = atom_mask.shape[:-1]
+        assert atom_prefix[: len(mask_prefix)] == mask_prefix
+        missing_prefix = atom_prefix[len(mask_prefix):]
+        if missing_prefix:
+            atom_mask = atom_mask.reshape(
+                *mask_prefix,
+                *((1,) * len(missing_prefix)),
+                atom_mask.size(-1),
+            ).expand(*atom_prefix, atom_mask.size(-1))
+        return atom_mask
 
 
 class ConditionedTransitionBlock(nn.Module):
@@ -753,6 +830,11 @@ class AtomAttentionEncoder(nn.Module):
             assert z is not None
 
         atom_to_token_idx = input_data.atom_to_token_idx
+        atom_padding_mask = getattr(input_data, "atom_padding_mask", None)
+        valid_atom_mask = None
+        if atom_padding_mask is not None:
+            valid_atom_mask = torch.logical_not(atom_padding_mask.bool())
+
         # Create the atom single conditioning: Embed per-atom meta data
         # [..., N_atom, C_atom]
         batch_shape = input_data.ref_pos.shape[:-2]
@@ -899,13 +981,18 @@ class AtomAttentionEncoder(nn.Module):
         
         # Cross attention transformer
         q_l = self.atom_transformer(
-            q_l, c_l, p_lm, chunk_size=chunk_size
+            q_l,
+            c_l,
+            p_lm,
+            atom_mask=valid_atom_mask,
+            chunk_size=chunk_size,
         )  # [..., (N_sample), N_atom, c_atom]
 
         # Aggregate per-atom representation to per-token representation
         a = aggregate_atom_to_token(
             x_atom=F.relu(self.linear_no_bias_q(q_l)),
             atom_to_token_idx=atom_to_token_idx,
+            atom_mask=valid_atom_mask,
             n_token=n_token,
             reduce="mean",
         )  # [..., (N_sample), N_token, c_token]
@@ -1001,8 +1088,17 @@ class AtomAttentionDecoder(nn.Module):
         )
 
         # Cross attention transformer
+        atom_padding_mask = getattr(input_data, "atom_padding_mask", None)
+        valid_atom_mask = None
+        if atom_padding_mask is not None:
+            valid_atom_mask = torch.logical_not(atom_padding_mask.bool())
         q = self.atom_transformer(
-            q, c_skip, p_skip, inplace_safe=inplace_safe, chunk_size=chunk_size
+            q,
+            c_skip,
+            p_skip,
+            atom_mask=valid_atom_mask,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
         )
 
         # Map to positions update
