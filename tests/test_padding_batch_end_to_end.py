@@ -99,13 +99,14 @@ def _forward_loss(
     loss_fn: ODesignLoss,
     symmetric_permutation: SymmetricPermutation,
     batch: dict,
+    current_step: int = 0,
 ) -> tuple:
     model_output, ground_truth, loss_input = model.forward(
         feature_data=batch["feature_data"],
         label_full_data=batch["label_full_data"],
         label_data=batch["label_data"],
         mode="train",
-        current_step=0,
+        current_step=current_step,
         symmetric_permutation=symmetric_permutation,
     )
     loss, metrics = loss_fn(
@@ -122,6 +123,295 @@ def _named_grads(model: ODesign) -> dict[str, torch.Tensor | None]:
         name: None if param.grad is None else param.grad.detach().cpu().clone()
         for name, param in model.named_parameters()
     }
+
+
+def _named_params(model: ODesign) -> dict[str, torch.Tensor]:
+    return {
+        name: param.detach().cpu().clone()
+        for name, param in model.named_parameters()
+    }
+
+
+def _assert_tensor_close(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    atol: float = 2e-5,
+    rtol: float = 2e-5,
+) -> None:
+    actual = actual.detach().cpu()
+    expected = expected.detach().cpu()
+    if not torch.is_floating_point(actual):
+        assert torch.equal(actual, expected), name
+        return
+
+    if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
+        max_abs = (actual - expected).abs().max().item()
+        raise AssertionError(
+            f"{name}: max_abs_diff={max_abs}, atol={atol}, rtol={rtol}"
+        )
+
+
+def _assert_optional_tensor_close(
+    name: str,
+    actual: torch.Tensor | None,
+    expected: torch.Tensor | None,
+    *,
+    atol: float = 2e-5,
+    rtol: float = 2e-5,
+) -> None:
+    if actual is None or expected is None:
+        assert actual is None and expected is None, name
+        return
+    _assert_tensor_close(name, actual, expected, atol=atol, rtol=rtol)
+
+
+def _assert_metrics_average_close(
+    step: int,
+    batched_metrics: dict[str, torch.Tensor],
+    micro_metrics: list[dict[str, torch.Tensor]],
+) -> None:
+    assert set(batched_metrics) == set(micro_metrics[0])
+    for metrics in micro_metrics[1:]:
+        assert set(metrics) == set(batched_metrics)
+
+    for key in sorted(batched_metrics):
+        expected = torch.stack([metrics[key] for metrics in micro_metrics]).mean()
+        _assert_tensor_close(
+            f"step {step} metrics[{key}]",
+            batched_metrics[key],
+            expected,
+        )
+
+
+def _assert_real_prefixes_close(
+    step: int,
+    batched_output,
+    batched_gt,
+    batched_loss_input,
+    micro_outputs: list,
+    micro_gts: list,
+    micro_loss_inputs: list,
+    token_lens: list[int],
+    atom_lens: list[int],
+) -> None:
+    atom_loss_input_names = [
+        "atom_padding_mask",
+        "distogram_rep_atom_mask",
+        "is_condition_atom",
+        "is_dna",
+        "is_ligand",
+        "is_rna",
+    ]
+    atom_ground_truth_names = [
+        "coordinate",
+        "coordinate_mask",
+    ]
+    atom_pair_ground_truth_names = [
+        "distance_mask",
+        "lddt_mask",
+    ]
+
+    for idx, (num_token, num_atom) in enumerate(zip(token_lens, atom_lens)):
+        for name in atom_ground_truth_names:
+            _assert_tensor_close(
+                f"step {step} ground_truth.{name}[{idx}]",
+                getattr(batched_gt, name)[idx, :num_atom],
+                getattr(micro_gts[idx], name)[0, :num_atom],
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        for name in atom_pair_ground_truth_names:
+            _assert_optional_tensor_close(
+                f"step {step} ground_truth.{name}[{idx}]",
+                getattr(batched_gt, name, None)[idx, :num_atom, :num_atom],
+                getattr(micro_gts[idx], name, None)[0, :num_atom, :num_atom],
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        for name in atom_loss_input_names:
+            _assert_optional_tensor_close(
+                f"step {step} loss_input.{name}[{idx}]",
+                getattr(batched_loss_input, name)[idx, :num_atom],
+                getattr(micro_loss_inputs[idx], name)[0, :num_atom],
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        _assert_tensor_close(
+            f"step {step} loss_input.resolution[{idx}]",
+            batched_loss_input.resolution[idx],
+            micro_loss_inputs[idx].resolution[0],
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+        _assert_optional_tensor_close(
+            f"step {step} output.coordinate[{idx}]",
+            batched_output["coordinate"][idx, :, :num_atom],
+            micro_outputs[idx]["coordinate"][0, :, :num_atom],
+        )
+        _assert_optional_tensor_close(
+            f"step {step} output.distogram[{idx}]",
+            batched_output["distogram"][idx, :num_token, :num_token],
+            micro_outputs[idx]["distogram"][0, :num_token, :num_token],
+        )
+        _assert_optional_tensor_close(
+            f"step {step} output.token_bond_type_logits[{idx}]",
+            batched_output["token_bond_type_logits"][idx, :num_token, :num_token],
+            micro_outputs[idx]["token_bond_type_logits"][0, :num_token, :num_token],
+        )
+        _assert_optional_tensor_close(
+            f"step {step} output.token_bond_gen_mask[{idx}]",
+            batched_output["token_bond_gen_mask"][idx, :num_token, :num_token],
+            micro_outputs[idx]["token_bond_gen_mask"][0, :num_token, :num_token],
+        )
+        _assert_optional_tensor_close(
+            f"step {step} output.noise_level[{idx}]",
+            batched_output["noise_level"][idx],
+            micro_outputs[idx]["noise_level"][0],
+        )
+
+
+def _assert_named_optional_tensors_close(
+    prefix: str,
+    actual: dict[str, torch.Tensor | None],
+    expected: dict[str, torch.Tensor | None],
+) -> int:
+    assert set(actual) == set(expected)
+    compared = 0
+    for name in sorted(actual):
+        if actual[name] is None or expected[name] is None:
+            assert actual[name] is None and expected[name] is None, name
+            continue
+        compared += 1
+        _assert_tensor_close(f"{prefix}.{name}", actual[name], expected[name])
+    return compared
+
+
+def _assert_named_tensors_close(
+    prefix: str,
+    actual: dict[str, torch.Tensor],
+    expected: dict[str, torch.Tensor],
+) -> int:
+    assert set(actual) == set(expected)
+    compared = 0
+    for name in sorted(actual):
+        compared += 1
+        _assert_tensor_close(f"{prefix}.{name}", actual[name], expected[name])
+    return compared
+
+
+def _run_multi_step_padding_batch_equivalence(num_steps: int = 3) -> None:
+    device = torch.device("cuda")
+    configs = _tiny_configs()
+    symmetric_permutation = SymmetricPermutation(configs)
+
+    samples = [
+        _sample(3, 4, 1, 1, "short"),
+        _sample(5, 7, 1, 3, "long"),
+    ]
+    token_lens = [3, 5]
+    atom_lens = [4, 7]
+    batch = _move_to_device(collate_fn_odesign_padded(samples), device)
+    single_batches = [
+        _move_to_device(collate_fn_odesign_padded([sample]), device)
+        for sample in samples
+    ]
+
+    torch.manual_seed(123)
+    batched_model = ODesign(configs).to(device)
+    micro_model = ODesign(configs).to(device)
+    micro_model.load_state_dict(batched_model.state_dict())
+    _make_training_diffusion_deterministic(batched_model)
+    _make_training_diffusion_deterministic(micro_model)
+    batched_model.train()
+    micro_model.train()
+
+    batched_loss_fn = ODesignLoss(configs)
+    micro_loss_fn = ODesignLoss(configs)
+    batched_optimizer = torch.optim.SGD(batched_model.parameters(), lr=1e-4)
+    micro_optimizer = torch.optim.SGD(micro_model.parameters(), lr=1e-4)
+
+    assert (
+        _assert_named_tensors_close(
+            "initial_parameter",
+            _named_params(batched_model),
+            _named_params(micro_model),
+        )
+        > 0
+    )
+
+    for step in range(num_steps):
+        batched_optimizer.zero_grad(set_to_none=True)
+        micro_optimizer.zero_grad(set_to_none=True)
+
+        batched_output, batched_gt, batched_loss_input, batched_loss, batched_metrics = (
+            _forward_loss(
+                batched_model,
+                batched_loss_fn,
+                symmetric_permutation,
+                batch,
+                current_step=step,
+            )
+        )
+        batched_loss.backward()
+        batched_grads = _named_grads(batched_model)
+
+        micro_outputs = []
+        micro_gts = []
+        micro_loss_inputs = []
+        micro_losses = []
+        micro_metrics = []
+        for single_batch in single_batches:
+            output, gt, loss_input, loss, metrics = _forward_loss(
+                micro_model,
+                micro_loss_fn,
+                symmetric_permutation,
+                single_batch,
+                current_step=step,
+            )
+            micro_outputs.append(output)
+            micro_gts.append(gt)
+            micro_loss_inputs.append(loss_input)
+            micro_losses.append(loss)
+            micro_metrics.append(metrics)
+        micro_loss = torch.stack(micro_losses).mean()
+        micro_loss.backward()
+        micro_grads = _named_grads(micro_model)
+
+        _assert_tensor_close(f"step {step} loss", batched_loss, micro_loss)
+        _assert_metrics_average_close(step, batched_metrics, micro_metrics)
+        _assert_real_prefixes_close(
+            step,
+            batched_output,
+            batched_gt,
+            batched_loss_input,
+            micro_outputs,
+            micro_gts,
+            micro_loss_inputs,
+            token_lens,
+            atom_lens,
+        )
+        assert (
+            _assert_named_optional_tensors_close(
+                f"step {step} grad",
+                batched_grads,
+                micro_grads,
+            )
+            > 0
+        )
+
+        batched_optimizer.step()
+        micro_optimizer.step()
+        assert (
+            _assert_named_tensors_close(
+                f"step {step} parameter_after_step",
+                _named_params(batched_model),
+                _named_params(micro_model),
+            )
+            > 0
+        )
 
 
 def _tiny_configs() -> ConfigDict:
@@ -683,3 +973,22 @@ def test_padding_batch_matches_average_of_single_item_training_steps(monkeypatch
             rtol=2e-5,
         ), name
     assert compared_grads > 0
+
+
+def test_padding_batch_matches_microbatch_accumulation_across_optimizer_steps(
+    monkeypatch,
+) -> None:
+    torch.manual_seed(0)
+    if not torch.cuda.is_available():
+        pytest.skip(
+            "ODesign multi-step training equivalence test requires CUDA because "
+            "the H image uses fused LayerNorm kernels without a CPU fallback."
+        )
+    torch.cuda.manual_seed_all(0)
+    monkeypatch.setattr(
+        generator_module,
+        "centre_random_augmentation",
+        _deterministic_centre_augmentation,
+    )
+
+    _run_multi_step_padding_batch_equivalence()

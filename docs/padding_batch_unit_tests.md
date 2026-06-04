@@ -37,6 +37,8 @@ blocks.
   - Builds a tiny CUDA ODesign config and runs padded batch training forward and
     backward.
   - Verifies the core batch=2 versus two batch=1 training-equivalence contract.
+  - Verifies the same equivalence across multiple optimizer steps, including
+    intermediate tensors, gradients, and parameters after each update.
   - Uses `pairformer.n_blocks=1`, `diffusion_module.atom_encoder.n_blocks=1`,
     `diffusion_module.transformer.n_blocks=1`, and
     `diffusion_module.atom_decoder.n_blocks=1`, so this is not only a shape-only
@@ -81,6 +83,33 @@ The test then:
 The comparison uses `torch.allclose(..., atol=2e-5, rtol=2e-5)` for model
 outputs and gradients. This tolerance is small enough to catch padding leakage
 while allowing normal CUDA floating-point ordering differences.
+
+## Multi-Step Optimizer Equivalence Test
+
+`test_padding_batch_matches_microbatch_accumulation_across_optimizer_steps` extends
+the one-step check to a short optimizer trajectory.
+
+The test uses the same two ragged samples and the same deterministic controls as
+the one-step test. It creates two identical models, then runs three SGD optimizer
+updates:
+
+1. The padded model runs one batch=2 forward/loss/backward.
+2. The micro-batch model runs two batch=1 forwards, averages the two scalar
+   losses, and backpropagates once through the averaged loss.
+3. Before each optimizer step, the test compares:
+   - scalar loss and every reported metric;
+   - real-prefix ground-truth coordinates, coordinate masks, `distance_mask`,
+     and `lddt_mask`;
+   - real-prefix `LossInput` atom masks and molecule-type masks;
+   - real-prefix predicted coordinates, distogram logits, bond-type logits,
+     bond-generation masks, and diffusion noise levels;
+   - every parameter gradient.
+4. After each optimizer step, the test compares every model parameter.
+
+Padding-only suffix regions are intentionally not compared against the
+single-item runs because those tensors do not exist in the unpadded
+single-sample batches. The contract is that all real token/atom prefixes,
+gradients, losses, and post-update parameters remain allclose.
 
 ## Mask and Batch-Axis Contract Tests
 
@@ -234,6 +263,18 @@ The latest full padding pytest run recorded during this work was:
     `de5162471a92be7eb009f7f7dbd71b1bdca90daf61498834b2202d568b193009`
   - `tests/test_padding_batch_end_to_end.py`:
     `c189b7d43235a8cb398cda5dd941f378bc7b45a92b323998c6bbe6ac7473857e`
+
+The latest dedicated multi-step optimizer equivalence run was:
+
+- RED job: `zjow-odesign-pad-multistep-red-0604-r2-91580369`
+  - result: expected failure,
+    `NameError: name '_run_multi_step_padding_batch_equivalence' is not defined`
+  - record directory:
+    `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/padding-batch-multistep-red-0604-r2`
+- GREEN job: `zjow-odesign-pad-multistep-green-0604-r1-98276998`
+  - result: `1 passed in 200.84s`
+  - record directory:
+    `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/padding-batch-multistep-green-0604-r1`
 
 ## Current Boundaries
 

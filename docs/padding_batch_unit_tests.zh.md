@@ -37,6 +37,8 @@
   - 构造一个 tiny CUDA ODesign 配置，并在 padded batch 上跑训练 forward 和
     backward。
   - 验证核心的 batch=2 vs 两个 batch=1 平均的训练等价性。
+  - 验证同一等价性在多个 optimizer step 上仍成立，包括中间张量、梯度以及每次
+    update 后的模型参数。
   - tiny config 中设置了 `pairformer.n_blocks=1`、
     `diffusion_module.atom_encoder.n_blocks=1`、
     `diffusion_module.transformer.n_blocks=1`、
@@ -80,6 +82,31 @@
 前向输出和参数梯度使用
 `torch.allclose(..., atol=2e-5, rtol=2e-5)` 比较。这个阈值足够小，可以捕获
 padding 泄漏，同时允许 CUDA 浮点计算顺序带来的正常细微差异。
+
+## 多步 Optimizer 等价性测试
+
+`test_padding_batch_matches_microbatch_accumulation_across_optimizer_steps` 把
+单步检查扩展成一段很短的 optimizer 轨迹。
+
+这个测试使用和单步测试相同的两个 ragged samples，也使用相同的随机性控制。它先
+创建两个初始参数完全相同的模型，然后执行 3 次 SGD optimizer update：
+
+1. padded model 执行一次 batch=2 forward/loss/backward。
+2. micro-batch model 分别执行两次 batch=1 forward，把两个 scalar loss 平均后，
+   对平均 loss 调用一次 backward。
+3. 每次 optimizer step 之前，比较：
+   - scalar loss 和每一个上报的 metric；
+   - 真实 atom prefix 上的 ground-truth coordinates、coordinate masks、
+     `distance_mask` 和 `lddt_mask`；
+   - 真实 atom prefix 上的 `LossInput` atom masks 和分子类型 masks；
+   - 真实 prefix 上的预测 coordinates、distogram logits、bond-type logits、
+     bond-generation masks 和 diffusion noise levels；
+   - 每一个参数梯度。
+4. 每次 optimizer step 之后，比较每一个模型参数。
+
+padding-only suffix 区域不会和单样本运行比较，因为单样本 batch 里不存在这些
+padded suffix。这个测试验证的契约是：真实 token/atom prefix、梯度、loss 以及
+update 后的模型参数都保持 allclose。
 
 ## Mask 和 Batch 轴 Contract Tests
 
@@ -225,6 +252,18 @@ python -m pytest -q \
     `de5162471a92be7eb009f7f7dbd71b1bdca90daf61498834b2202d568b193009`
   - `tests/test_padding_batch_end_to_end.py`：
     `c189b7d43235a8cb398cda5dd941f378bc7b45a92b323998c6bbe6ac7473857e`
+
+最新一次专门的多步 optimizer 等价性验证是：
+
+- RED job：`zjow-odesign-pad-multistep-red-0604-r2-91580369`
+  - 结果：预期失败，
+    `NameError: name '_run_multi_step_padding_batch_equivalence' is not defined`
+  - record directory：
+    `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/padding-batch-multistep-red-0604-r2`
+- GREEN job：`zjow-odesign-pad-multistep-green-0604-r1-98276998`
+  - 结果：`1 passed in 200.84s`
+  - record directory：
+    `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/padding-batch-multistep-green-0604-r1`
 
 ## 当前边界
 
