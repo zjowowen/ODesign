@@ -1395,27 +1395,93 @@ class ODesignLoss(nn.Module):
                 distance_mask (torch.Tensor): atom-atom mask indicating whether true distance exists.
                     [..., N_atom, N_atom]
         """
-        # Distance mask
-        distance_mask = (
-            ground_truth.coordinate_mask[..., None]
-            * ground_truth.coordinate_mask[..., None, :]
+        legacy_unbatched = ground_truth.coordinate.dim() == 2
+        coordinate = (
+            ground_truth.coordinate.unsqueeze(0)
+            if legacy_unbatched
+            else ground_truth.coordinate
         )
-        # Distances for all atom pairs
-        # Note: we convert to bf16 for saving cuda memory, if performance drops, do not convert it
-        distance = (
-            cdist(ground_truth.coordinate, ground_truth.coordinate) * distance_mask
-        ).to(
-            ground_truth.coordinate.dtype
-        )  # [..., N_atom, N_atom]
+        coordinate_mask = (
+            ground_truth.coordinate_mask.unsqueeze(0)
+            if legacy_unbatched
+            else ground_truth.coordinate_mask
+        )
+        is_nucleotide = torch.logical_or(loss_input.is_rna, loss_input.is_dna)
+        if legacy_unbatched:
+            is_nucleotide = is_nucleotide.unsqueeze(0)
 
-        lddt_mask = compute_lddt_mask(
-            true_distance=distance,
-            distance_mask=distance_mask,
-            is_nucleotide=torch.logical_or(
-                loss_input.is_rna, loss_input.is_dna
-            ),
-            **self.lddt_radius,
+        atom_padding_mask = getattr(loss_input, "atom_padding_mask", None)
+        if legacy_unbatched and atom_padding_mask is not None:
+            atom_padding_mask = atom_padding_mask.unsqueeze(0)
+
+        batch_shape = coordinate.shape[:-2]
+        num_atom = coordinate.shape[-2]
+        distance = coordinate.new_zeros(*batch_shape, num_atom, num_atom)
+        distance_mask = coordinate_mask.new_zeros(*batch_shape, num_atom, num_atom)
+        lddt_mask = coordinate.new_zeros(*batch_shape, num_atom, num_atom)
+
+        flat_coordinate = coordinate.reshape(-1, num_atom, coordinate.shape[-1])
+        flat_coordinate_mask = coordinate_mask.reshape(-1, num_atom)
+        flat_is_nucleotide = is_nucleotide.reshape(-1, num_atom)
+        flat_distance = distance.reshape(-1, num_atom, num_atom)
+        flat_distance_mask = distance_mask.reshape(-1, num_atom, num_atom)
+        flat_lddt_mask = lddt_mask.reshape(-1, num_atom, num_atom)
+        flat_atom_padding_mask = (
+            None
+            if atom_padding_mask is None
+            else atom_padding_mask.reshape(-1, num_atom)
         )
+
+        # Compute label distances per real sample. This keeps LDDT labels
+        # independent of co-batched padding shape, so bsz1 and padded bsz2 see
+        # the same per-sample atom-pair mask.
+        for sample_idx in range(flat_coordinate.shape[0]):
+            if flat_atom_padding_mask is None:
+                real_atom_len = num_atom
+            else:
+                real_atom_len = int(
+                    (~flat_atom_padding_mask[sample_idx].bool()).sum().item()
+                )
+            if real_atom_len == 0:
+                continue
+
+            sample_coordinate = flat_coordinate[
+                sample_idx : sample_idx + 1, :real_atom_len
+            ]
+            sample_coordinate_mask = flat_coordinate_mask[
+                sample_idx : sample_idx + 1, :real_atom_len
+            ]
+            sample_distance_mask = (
+                sample_coordinate_mask[..., None]
+                * sample_coordinate_mask[..., None, :]
+            )
+            # Note: we convert to bf16 for saving cuda memory, if performance drops, do not convert it
+            sample_distance = (
+                cdist(sample_coordinate, sample_coordinate) * sample_distance_mask
+            ).to(ground_truth.coordinate.dtype)
+            sample_lddt_mask = compute_lddt_mask(
+                true_distance=sample_distance,
+                distance_mask=sample_distance_mask,
+                is_nucleotide=flat_is_nucleotide[
+                    sample_idx : sample_idx + 1, :real_atom_len
+                ],
+                **self.lddt_radius,
+            )
+
+            flat_distance[
+                sample_idx, :real_atom_len, :real_atom_len
+            ] = sample_distance.squeeze(0)
+            flat_distance_mask[
+                sample_idx, :real_atom_len, :real_atom_len
+            ] = sample_distance_mask.squeeze(0)
+            flat_lddt_mask[
+                sample_idx, :real_atom_len, :real_atom_len
+            ] = sample_lddt_mask.squeeze(0)
+
+        if legacy_unbatched:
+            distance = distance.squeeze(0)
+            distance_mask = distance_mask.squeeze(0)
+            lddt_mask = lddt_mask.squeeze(0)
 
         ground_truth.update(
             {

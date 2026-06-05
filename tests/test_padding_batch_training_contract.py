@@ -1,18 +1,21 @@
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 from attr import define
 
-from src.api.model_interface import ODesignOutput
+from src.api.model_interface import GroundTruth, LossInput, ODesignOutput
 from src.model.modules.generator import _diffusion_sample_shape
 from src.model.modules.head import BondTypeHead
+from src.model.modules import loss as loss_module
 from src.model.modules.loss import (
     BondLoss,
     BondTypeLoss,
     DistogramLoss,
     _diffusion_condition_align_mask,
     MSELoss,
+    ODesignLoss,
     SmoothLDDTLoss,
     _apply_last_dim_mask,
     _apply_resolution_gate,
@@ -552,6 +555,109 @@ def test_apply_resolution_gate_averages_only_valid_examples() -> None:
         _apply_resolution_gate(torch.tensor(5.0), torch.tensor([0.0])),
         torch.tensor(0.0),
     )
+
+
+def test_update_label_uses_singleton_batched_distance_path_for_legacy_unbatched_input(
+    monkeypatch,
+) -> None:
+    loss_fn = ODesignLoss.__new__(ODesignLoss)
+    loss_fn.lddt_radius = {
+        "is_nucleotide_threshold": 30.0,
+        "is_not_nucleotide_threshold": 15.0,
+    }
+    loss_fn.configs = SimpleNamespace(
+        model=SimpleNamespace(loss_metrics_sparse_enable=True)
+    )
+
+    def shape_sensitive_cdist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        assert a.shape == b.shape
+        distance = torch.zeros(*a.shape[:-1], a.shape[-2])
+        if a.dim() == 2:
+            distance[0, 1] = distance[1, 0] = 15.01
+        else:
+            distance[..., 0, 1] = 14.99
+            distance[..., 1, 0] = 14.99
+        return distance
+
+    monkeypatch.setattr(loss_module, "cdist", shape_sensitive_cdist)
+
+    loss_input = LossInput(
+        is_rna=torch.zeros(2, dtype=torch.bool),
+        is_dna=torch.zeros(2, dtype=torch.bool),
+        is_ligand=torch.zeros(2, dtype=torch.bool),
+        is_condition_atom=torch.zeros(2, dtype=torch.bool),
+        resolution=torch.tensor(2.0),
+        distogram_rep_atom_mask=torch.ones(2, dtype=torch.bool),
+    )
+    ground_truth = GroundTruth(
+        coordinate=torch.zeros(2, 3),
+        coordinate_mask=torch.ones(2, dtype=torch.bool),
+    )
+
+    updated = loss_fn.update_label(loss_input, ground_truth)
+
+    assert updated.lddt_mask.shape == (2, 2)
+    assert updated.lddt_mask[0, 1].item() == 1.0
+    assert updated.lddt_mask[1, 0].item() == 1.0
+
+
+def test_update_label_computes_padded_batch_labels_per_sample_prefix(
+    monkeypatch,
+) -> None:
+    loss_fn = ODesignLoss.__new__(ODesignLoss)
+    loss_fn.lddt_radius = {
+        "is_nucleotide_threshold": 30.0,
+        "is_not_nucleotide_threshold": 15.0,
+    }
+    loss_fn.configs = SimpleNamespace(
+        model=SimpleNamespace(loss_metrics_sparse_enable=True)
+    )
+    cdist_shapes = []
+
+    def shape_sensitive_cdist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        assert a.shape == b.shape
+        cdist_shapes.append(tuple(a.shape))
+        distance = torch.zeros(*a.shape[:-1], a.shape[-2])
+        if a.shape == (2, 3, 3):
+            distance[..., 0, 1] = 15.01
+            distance[..., 1, 0] = 15.01
+        else:
+            distance[..., 0, 1] = 14.99
+            distance[..., 1, 0] = 14.99
+        return distance
+
+    monkeypatch.setattr(loss_module, "cdist", shape_sensitive_cdist)
+
+    atom_padding_mask = torch.tensor(
+        [
+            [False, False, True],
+            [False, False, False],
+        ]
+    )
+    loss_input = LossInput(
+        is_rna=torch.zeros(2, 3, dtype=torch.bool),
+        is_dna=torch.zeros(2, 3, dtype=torch.bool),
+        is_ligand=torch.zeros(2, 3, dtype=torch.bool),
+        is_condition_atom=torch.zeros(2, 3, dtype=torch.bool),
+        resolution=torch.tensor([2.0, 2.0]),
+        distogram_rep_atom_mask=torch.ones(2, 3, dtype=torch.bool),
+        atom_padding_mask=atom_padding_mask,
+    )
+    ground_truth = GroundTruth(
+        coordinate=torch.zeros(2, 3, 3),
+        coordinate_mask=~atom_padding_mask,
+    )
+
+    updated = loss_fn.update_label(loss_input, ground_truth)
+
+    assert cdist_shapes == [(1, 2, 3), (1, 3, 3)]
+    assert updated.lddt_mask.shape == (2, 3, 3)
+    assert updated.lddt_mask[0, 0, 1].item() == 1.0
+    assert updated.lddt_mask[0, 1, 0].item() == 1.0
+    assert updated.lddt_mask[0, 2].sum().item() == 0.0
+    assert updated.lddt_mask[0, :, 2].sum().item() == 0.0
+    assert updated.lddt_mask[1, 0, 1].item() == 1.0
+    assert updated.lddt_mask[1, 1, 0].item() == 1.0
 
 
 def test_apply_last_dim_mask_preserves_batched_ragged_atom_axis() -> None:
