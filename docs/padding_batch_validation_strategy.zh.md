@@ -546,6 +546,8 @@ bsz1 path:
 > 在 no-TF32/fp32、禁用 permutation、固定 MSA rows、真实 `35999.pt` checkpoint 和真实样本 trace 下，最新 4GPU DDP replay 已经在 `ATOL/RTOL=5e-4`、`DIAGNOSTIC_ATOL/RTOL=1e-4`、3 个 optimizer update 上通过。这个结论支持“训练集成层面 bsz2 与 bsz1 等价”，但不声称 bitwise 或 `1e-6` 级 strict replay 等价。
 >
 > 审计指出的两个 r9 边界已经拆分补证：r11 在 4GPU、1 update 下保存并比较 pre/post full-grad tensor 且 grad compare failure 为 0；r13 在 4GPU、`per_rank_samples=2`、1 update 下启用 forward hook probe，并在 forward-probe 专用 `ATOL/RTOL=5e-3` 下通过；r18 进一步在 4GPU、`per_rank_samples=10`、1 update、`FORWARD_PROBE_SAMPLE_POS=0`、no-evo/fp32/no-TF32 控制变量下通过 forward-probe replay；r20 在 2GPU、同控制变量、`FORWARD_PROBE_SAMPLE_POS=9` 下通过。r13/r18/r20 是 forward-probe 证据，不替代 r9/r10 的 3 update replay；r11 是 full-grad tensor 证据，但 strict forward probe 在 `1e-4` sampled-value 阈值下仍失败。
+>
+> 8GPU 单节点 r8 replay artifact 已在 3 update、`1e-4` diagnostic 口径下通过；16GPU 跨节点 r7 已实际运行到 3 update，但只有 1 个 `pred_coordinate` sample diagnostic failure，`max_abs=1.17e-4`，record/state/grad sync 均通过。因此当前已有 8GPU gate pass，但 16GPU strict replay 仍不是 pass。
 
 已核验的证据链：
 
@@ -759,7 +761,7 @@ bsz1 path:
    - 结论：
      r20 是针对 `FORWARD_PROBE_SAMPLE_POS=0` 覆盖边界的定向补强，说明 2GPU、`per_rank_samples=10`、末尾 sample position `9` 也通过；但它不能替代 4GPU/8GPU/16GPU world-size gate，也不提供 full-grad tensor 证据。
 
-15. r7 no-TF32 16GPU DDP replay 提交合同：
+15. r7 no-TF32 16GPU DDP replay：
    - H200 job：
      `zjow-odesign-replay16g-notf32-0606-r7`
    - 提交时间：
@@ -788,10 +790,16 @@ bsz1 path:
      diagnostic 阈值 `DIAGNOSTIC_ATOL=1e-4/DIAGNOSTIC_RTOL=1e-4`。
    - 输出目录：
      `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_16gpu_notf32_h200_0606_r7`
-   - 当前状态：
-     `Inqueue`，两个 replica 均为 `STARTING/Pending`；事件为 `pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable`。这表示 gang 调度尚未拿到两台 8GPU 节点，不是 user code 或 runner 启动失败。
+   - 最终结果：
+     共享盘 artifact 已写出 `outputs/summary.json`，`summary.status = fail`，`world_size = 16`，`updates = 3`，`failure_count = 1`，`diagnostic_failure_count = 1`，`record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`。
+   - 深查结果：
+     `bsz2_gacc5` 16 个 rank 共 48 条 records，sample/forward/grad/diagnostic failure 均为 0，record/state/sync 均未失败。`bsz1_gacc10` 16 个 rank 共 48 条 records，其中只有 `rank04_records.json` 的 `update_idx=2` 出现 1 个 sample diagnostic failure；`record_compare.allclose = true`，grad summary allclose，pre/post grad hash 和 state hash sync 均为 true。
+   - 失败来源：
+     唯一失败样本为 `rank=4`、`update_idx=2`、`sample_pos=1`、`data_index=1205544`、`real_atom_len=1184`，`pred_coordinate` 的 `max_abs = 1.1730194091796875e-04`，略高于 `DIAGNOSTIC_ATOL=1e-4`；`noise_level`、`coordinate_mask`、`lddt_mask` 等控制张量均 allclose。
+   - 结论：
+     r7 覆盖了正式 `2 node x 8 GPU` world size 和跨节点通信，但没有在 `1e-4` sample diagnostic 口径下完全通过。由于主 record/state/grad sync 全部通过，且唯一差异为 `pred_coordinate` 的 `1.17e-4` 量级尾差，当前判断更接近 16GPU 跨节点 shape-sensitive fp32 数值尾差，而不是 padding/mask/trace 错位。它不能作为 16GPU strict replay pass 证据，但可以作为“16GPU 主训练 record/state/grad sync 无异常”的诊断证据。
 
-16. r8 no-TF32 8GPU 单节点 engineering replay 提交合同：
+16. r8 no-TF32 8GPU 单节点 engineering replay：
    - H200 job：
      `zjow-odesign-replay8g-notf32-0606-r1`
    - 提交时间：
@@ -820,8 +828,14 @@ bsz1 path:
      diagnostic 阈值 `DIAGNOSTIC_ATOL=1e-4/DIAGNOSTIC_RTOL=1e-4`。
    - 输出目录：
      `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_8gpu_notf32_h200_0606_r1`
-   - 当前状态：
-     `Inqueue`，单 replica 为 `STARTING/Pending`；事件为 `pod group is not ready, 1 Pending, 1 minAvailable; Pending: 1 Unschedulable`。这表示当前没有可调度的单节点 8GPU 资源，不是 user code 或 runner 启动失败。
+   - 最终结果：
+     共享盘 artifact 已写出 `outputs/summary.json`，`summary.status = pass`，`world_size = 8`，`updates = 3`，`failure_count = 0`，`diagnostic_failure_count = 0`，`record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`。
+   - 深查结果：
+     `bsz2_gacc5` 和 `bsz1_gacc10` 各 8 个 rank、共各 24 条 records；sample/forward/grad/diagnostic failure 均为 0，record/state/sync 均未失败。
+   - 注意：
+     H200 MCP 聚合状态显示该 job 为 `Failed`，但共享盘 replay artifact 的 `outputs/summary.json` 为 `pass`，stdout tail 也显示 replay summary pass。当前以 replay artifact 作为模型等价性证据，以 H200 job 聚合状态作为外层作业状态异常另行记录。
+   - 结论：
+     r8 通过单节点 8GPU、3 update replay，是当前正式每节点 GPU 数的工程 gate 通过证据；它仍不覆盖跨节点通信，不能替代 r7 的 16GPU gate。
 
 当前判断：
 
@@ -832,6 +846,8 @@ bsz1 path:
 - r9/r10 说明在 no-TF32/fp32、单节点 4GPU DDP、3 update、`diagnostic_atol/rtol=1e-4` 下，bsz2 与 bsz1 replay 已经完整通过；这是当前训练集成层面的主要通过证据。
 - r11 说明 4GPU、1 update 下 pre/post full-grad tensor 全量保存比较通过，关闭了 r9 中 `SAVE_GRAD_TENSORS=false` 的审计边界。
 - r13 说明 4GPU、1 update、`per_rank_samples=2` 下 forward hook 中间层 probe 通过；r18 进一步说明同一 no-evo/fp32/no-TF32 控制变量下，4GPU、1 update、`per_rank_samples=10`、`FORWARD_PROBE_SAMPLE_POS=0` 的 forward-probe replay 也通过；r20 说明 2GPU、同控制变量、`FORWARD_PROBE_SAMPLE_POS=9` 也通过。三者共同补上 r9 未启用 forward-probe 的证据，其中 r18 覆盖 4GPU pos0，r20 仅作为 2GPU pos9 定向补强；该证据仍不覆盖所有 sample position，也不覆盖 3 update forward-probe；该结论使用 forward-probe 专用 `ATOL/RTOL=5e-3`。
+- r8 说明单节点 8GPU、3 update replay artifact 已通过，补上了正式每节点 GPU 数的单节点工程 gate；但它不覆盖跨节点通信。
+- r7 说明 16GPU、2 node x 8 GPU replay 已实际运行到 3 update，并且主 record/state/grad sync 全部通过；但 `rank=4/update=2/sample_pos=1` 的 `pred_coordinate max_abs=1.17e-4` 略超 `1e-4` diagnostic 阈值，因此不能 claim 16GPU strict replay pass。
 - r14 说明如果缺少 `MODEL_DTYPE=fp32` 和 `USE_DEEPSPEED_EVO_ATTENTION=false` 这些控制变量，`per_rank_samples=10、FORWARD_PROBE_SAMPLE_POS=0` 的 forward probe 会失败；它是 dtype/kernel 敏感性的诊断信号，不是 padding batch 改造的反证。
 - 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议将 `2e-5` 视为真实大模型 CUDA fp32 full-grad 路径的强诊断阈值，将 `1e-4` 视为单节点 DDP sample/grad 诊断阈值，将 `5e-3` 视为深层 forward hook sampled-value spot check 的当前工程容差，将 `5e-4` 作为训练集成层面的主阈值。
 - 对正式训练，TF32 可以作为性能路径保留，但不能期望 `bsz2` 与 `bsz1` 在 `1e-6` 级别严格 replay 等价。正式训练应更多依赖 loss/grad/state 的合理容差和后续 PBP/ODesignBench 指标，而不是 bitwise 或 near-bitwise 等价。
@@ -844,8 +860,8 @@ bsz1 path:
 - r9/r10 已覆盖单节点 4GPU DDP、3 update 和 `1e-4` diagnostic 通过，但 r9/r10 本身未保存完整 grad tensor、也未启用 forward probe；这些边界分别由 r11 和 r13 补证。
 - r11 的 full-grad tensor 证据只覆盖 4GPU、1 update，不覆盖 3 update full-grad tensor 全量保存。
 - r13 的 forward-probe 证据只覆盖 4GPU、1 update、`per_rank_samples=2` 的 lightweight replay；r18 已补到 4GPU、1 update、`per_rank_samples=10`、`FORWARD_PROBE_SAMPLE_POS=0`；r20 已补到 2GPU、1 update、`per_rank_samples=10`、`FORWARD_PROBE_SAMPLE_POS=9`。这些仍不覆盖所有 sample position，也不覆盖 3 update 全长度 forward-probe replay。
-- r7 16GPU DDP replay 已提交并通过 dry-run/runtime preflight，但截至 `2026-06-06 19:34 +0800` 仍在排队；当前尚未覆盖正式 world size 和跨节点通信的实际执行结果。
-- r8 8GPU 单节点 engineering replay 已提交并通过 dry-run，但截至 `2026-06-06 19:34 +0800` 仍在排队；它即使完成，也只能作为单节点 8 rank 工程信号，不能替代 r7。
+- r7 已覆盖正式 world size 和跨节点通信的实际执行，但在 `1e-4` sample diagnostic 口径下有 1 个 `pred_coordinate` 尾差失败；尚未得到 16GPU strict replay pass。
+- r8 已覆盖单节点 8GPU、3 update artifact pass，但 H200 MCP 聚合状态显示外层 job 为 `Failed`；需要后续确认外层状态为何与 replay summary 不一致。
 
 ## 阶段二推荐实验矩阵
 
