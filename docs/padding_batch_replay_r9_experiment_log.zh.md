@@ -491,6 +491,39 @@ r13 对脚本的实验控制改动：
 
 结论：r20 是针对独立审计“r18/r19 只覆盖 `FORWARD_PROBE_SAMPLE_POS=0`”措辞边界的定向补强。它说明在同一 no-evo/fp32/no-TF32 控制变量下，2GPU、`per_rank_samples=10`、末尾 sample position `9` 的 forward-probe replay 也通过；但它仍不能替代 4GPU/8GPU/16GPU world-size gate，也不提供 full-grad tensor 证据。
 
+### r22 2GPU full-grad + forward-probe 组合补强
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0607_r22_fullgrad_fwd2samp5e3` |
+| run dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0607_r22_fullgrad_fwd2samp5e3` |
+| 运行容器 | `zjow-odesign-pbp-2gpu-clone20260606162953-94144454-jl5md` |
+| return code | `0` |
+| `summary.status` | `pass` |
+| world size | `2` |
+| updates | `1` |
+| `per_rank_samples` | `2` |
+| `MODEL_DTYPE` | `fp32` |
+| `USE_DEEPSPEED_EVO_ATTENTION` | `false` |
+| `DISABLE_TF32/NVIDIA_TF32_OVERRIDE` | `true / 0` |
+| `save_grad_tensors` | `true` |
+| `FORWARD_PROBE_SAMPLE_POS` | `0` |
+| main `ATOL/RTOL` | `5e-4 / 5e-4` |
+| diagnostic `ATOL/RTOL` | `1e-4 / 1e-4` |
+| forward probe `ATOL/RTOL` | `5e-3 / 5e-3` |
+| `failure_count` | `0` |
+| `record/state/state_sync/diagnostic_failure_count` | 全部 `0` |
+
+深查记录：
+
+- `outputs/summary.json` 和顶层 `summary.json` 均存在，`status=pass`。
+- `bsz2_gacc5/pre_clip_grad_after_update_0.pt` 大小约 `1.424067262GB`，`bsz2_gacc5/post_clip_grad_after_update_0.pt` 大小约 `1.424071194GB`，作为 full-grad reference 保存。
+- `bsz1_gacc10/rank00_records.json` 的 `record_compare.allclose=true`、`state_compare.allclose=true`、`pre_clip_grad_compare.allclose=true`、`post_clip_grad_compare.allclose=true`。
+- `bsz1_gacc10` rank0..1 的 `sample_compare_failure_count=0`、`forward_probe_failure_count=0`、`grad_compare_failure_count=0`、`pre_clip_grad_hashes_synced=true`、`post_clip_grad_hashes_synced=true`、`state_hashes_synced=true`。
+- 运行快照记录了 runner sha256 `b0082d19231fb10e8723b16c9210b4e505a92b766d72d81bc6e3916763af3836` 和 probe sha256 `24cb2ef0469dfa70d31b19ca7bc7f51241c0d372e734d38c0e3123b23dd0b6eb`。外层共享盘 repo 快照为 `cc95c2f8f915af4d87b1db3f44c4db2df8566a41` 加 dirty runtime 改动；因此 r22 是集群 runtime artifact 证据，不是干净 commit 证据。
+
+结论：r22 在同一个 2GPU、1 update、`per_rank_samples=2` replay 中同时打开 `SAVE_GRAD_TENSORS=true` 和 `FORWARD_PROBE_SAMPLE_POS=0`，并在 no-evo/fp32/no-TF32 控制变量下通过。它补强了 r11/r13 分别提供 full-grad 和 forward-probe 证据的组合边界；但它仍是低成本组合补强，不替代 r9/r10 的 4GPU 3 update 主 replay，不覆盖 `per_rank_samples=10` 的 full-grad 组合，也不覆盖 8GPU/16GPU world-size gate。
+
 ### r10-r13 补做实验独立事实审计
 
 在 r10-r13 补做实验完成后，已再次启动独立只读 Codex 审计会话核查 r10/r11/r12/r13 的 summary、returncode、rank record、实际产物和文档措辞。审计 verdict 为 `pass`，并确认：
@@ -500,7 +533,7 @@ r13 对脚本的实验控制改动：
 - r12 没有 `summary.status=pass` 证据，文档必须保持“中止/不作为通过证据”的表述。
 - r13 的 `FORWARD_PROBE_SAMPLE_POS=0` 见 `env_node0.txt`，`summary.status=pass`，`forward_probe_atol/rtol=5e-3/5e-3`；rank0..3 的 `forward_probe_failure_count=0`、`sample_compare_failure_count=0`、`grad_compare_failure_count=0`，`record_compare.allclose=true`，rank0 `state_compare.allclose=true`，all ranks `state_hashes_synced=true`。
 
-审计指出的一处文档措辞修正已经完成：r12 forward probe JSON 数量明确为 bsz2 侧 4 个，加上 bsz1 早期产物合计 8 个。当前仍需保留的限制是：r13 只覆盖 `updates=1`、`per_rank_samples=2` 的 forward-probe lightweight replay；r11 只覆盖 `updates=1` 的 full-grad tensor 补证；r9/r10 才是 3 update、10 samples/rank 的主训练集成 replay 证据。r14-r20 是后续新增补做记录，需要单独审计。
+审计指出的一处文档措辞修正已经完成：r12 forward probe JSON 数量明确为 bsz2 侧 4 个，加上 bsz1 早期产物合计 8 个。当前仍需保留的限制是：r13 只覆盖 `updates=1`、`per_rank_samples=2` 的 forward-probe lightweight replay；r11 只覆盖 `updates=1` 的 full-grad tensor 补证；r22 只覆盖 2GPU、1 update、`per_rank_samples=2` 的 full-grad + forward-probe 组合补强；r9/r10 才是 3 update、10 samples/rank 的主训练集成 replay 证据。r14-r22 是后续新增补做记录，需要单独审计。
 
 ## 独立审计
 
