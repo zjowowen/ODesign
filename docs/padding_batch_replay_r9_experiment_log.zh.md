@@ -6,7 +6,7 @@
 
 r9 证明的是：
 
-- 在单节点 4GPU DDP、真实 ODesign 数据、真实 `35999.pt` checkpoint、固定 sample trace、固定/禁用主要随机源、no-TF32/fp32 路径下，`batch_size_per_device=2, grad_accum=5` 与 `batch_size_per_device=1, grad_accum=10` 在 3 个 optimizer update 内训练集成层面等价。
+- 在 `SMOKE_MODE=1`、单节点 4GPU DDP、真实 ODesign 数据、真实 `35999.pt` checkpoint、固定 sample trace、固定/禁用主要随机源、no-TF32/fp32 路径下，`batch_size_per_device=2, grad_accum=5` 与 `batch_size_per_device=1, grad_accum=10` 在 3 个 optimizer update 内训练集成层面等价。
 - 通过口径是主阈值 `ATOL/RTOL=5e-4` 和 diagnostic 阈值 `DIAGNOSTIC_ATOL/RTOL=1e-4`。
 - r9 不证明 bitwise 等价，不证明 `1e-6` 级 strict replay 等价，不证明 16GPU 跨节点正式 world size 已通过，也不证明正式长训收敛和 PBP/ODesignBench 指标已通过。
 
@@ -186,7 +186,7 @@ torchrun \
 说明：
 
 - `bsz2_gacc5` 是 reference variant，因此 `record_compare` 和 `state_compare` 为空是预期行为。
-- `bsz1_gacc10` 的 `record_compare.allclose=true` 覆盖 4 个 rank、3 个 update。
+- `bsz1_gacc10` 的 `record_compare.allclose=true` 覆盖 4 个 rank、3 个 update；最后一条 record 是 `update_idx=2`。
 - rank0 保存并比较完整 state，因此 rank0 的 `state_compare.allclose=true` 覆盖 3 个 update；非 rank0 不重复保存完整 state compare，但 all-rank `state_hashes_synced=true`。
 - 4 个 rank 的 `pre_clip_grad_hashes_synced=true`、`post_clip_grad_hashes_synced=true`、`state_hashes_synced=true`，说明 DDP 同步没有 rank 分叉。
 - r9 未启用 forward probe；如果需要补强“中间层 forward tensor”证据，应另跑 `FORWARD_PROBE_SAMPLE_POS=0` 或其他 sample position 的 repeat。
@@ -286,4 +286,12 @@ torchrun \
 - 范围：远端 `summary.json`、records、`launch_env.sh`、runner command、本地文档一致性、claim boundary。
 - 要求：不修改文件，不启动或停止任务，不使用网络搜索。
 
-审计结果返回后，应把结论追加到本文档或主验证文档中。
+审计结果：
+
+- verdict: `pass`。
+- 核查确认远端 `summary.json`、`bsz1_gacc10/rank00..03_records.json`、`bsz2_gacc5/rank00..03_records.json`、`launch_env.sh`、`env_node0.txt`、`stdout_stderr_node0.log`、`returncode_node0.txt` 均存在并与 r9 claim 一致。
+- 核查确认 `summary.json` 中 `status='pass'`，`world_size=4`，`updates=3`，`trace_seed=20260605`，主阈值 `5e-4`，diagnostic 阈值 `1e-4`，全部 failure count 为 0。
+- 核查确认 r9 是 `SMOKE_MODE=1` 的单节点 4GPU DDP replay，不是 16GPU 跨节点 replay，不是正式长训。
+- 核查确认 `SAVE_GRAD_TENSORS=false`，所以不能宣称 4GPU 每 rank full-grad tensor 全量保存比较通过。
+- 核查确认 `FORWARD_PROBE_SAMPLE_POS=-1`，所以不能宣称 forward hook 细粒度中间层 probe 已通过。
+- 审计建议已采纳：显式记录 `SMOKE_MODE=1`，把“4GPU replay”收紧为“单节点 4GPU DDP replay”，把“最后一个 update”改为“最后一条 record (`update_idx=2`)”。
