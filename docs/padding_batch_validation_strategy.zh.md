@@ -640,6 +640,8 @@ bsz1 path:
 6. r9 no-TF32 4GPU DDP replay，diagnostic 1e-4：
    - run dir：
      `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r9_diag1e4`
+   - 详细实验日志：
+     `docs/padding_batch_replay_r9_experiment_log.zh.md`
    - 运行载体：
      长时 4GPU 交互容器 `zjow-sci2-bs-pbp-4gpu-clone20260606162737-59667537-2g4sk`。
    - 环境控制：
@@ -663,10 +665,11 @@ bsz1 path:
      - `world_size = 4`，`updates = 3`。
      - `failure_count = 0`。
      - `record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`，`diagnostic_failure_count = 0`。
-     - `bsz1_gacc10` 的 4 个 rank 均有 3 条 records；每个 rank 的最后一个 update 都满足 `record_compare.allclose = true`，`diagnostic_failure_count = 0`，`sample_compare_failure_count = 0`，`forward_probe_failure_count = 0`，`grad_compare_failure_count = 0`，`state_hashes_synced = true`。
+     - `bsz1_gacc10` 的 4 个 rank 均有 3 条 records；每个 rank 的最后一个 update 都满足 `record_compare.allclose = true`，`diagnostic_failure_count = 0`，`sample_compare_failure_count = 0`，`grad_compare_failure_count = 0`，`state_hashes_synced = true`。
+     - `FORWARD_PROBE_SAMPLE_POS=-1`，因此 r9 未启用 forward hook 细粒度 probe；`forward_probe_failure_count = 0` 只能说明没有 forward probe failure，不能作为 forward probe 通过证据。
      - rank0 的 `state_compare.allclose = true` 覆盖 3 个 update；非 rank0 不重复保存完整 state compare，但 all-rank state hash 同步。
    - 结论：
-     这是当前阶段二最强的单节点 DDP replay 证据。它把 r6 中 `2e-5` diagnostic 阈值下的 forward/sample 尾差，收敛为 `1e-4` diagnostic 阈值下的完整 3 update 通过；主训练 record、state、grad summary、sample tensor、forward probe 和 DDP 同步 hash 均未出现 failure。
+     这是当前阶段二最强的单节点 DDP replay 证据。它把 r6 中 `2e-5` diagnostic 阈值下的 sample tensor 尾差，收敛为 `1e-4` diagnostic 阈值下的完整 3 update 通过；主训练 record、state、grad summary、sample tensor 和 DDP 同步 hash 均未出现 failure。r9 未启用 forward probe，若要补强中间层 forward tensor 证据，需要另跑 forward-probe repeat。
 
 7. r7 no-TF32 16GPU DDP replay 提交合同：
    - H200 job：
