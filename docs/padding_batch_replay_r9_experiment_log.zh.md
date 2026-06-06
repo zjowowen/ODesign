@@ -277,6 +277,231 @@ torchrun \
 - Repeat C 是补充中间层证据，不替代 Repeat A 的 exact repeat。
 - 如果 Repeat C 在 `DIAGNOSTIC_ATOL/RTOL=1e-4` 下失败，但主 record/state 通过，应沿用 r4/r6 的分析方式，先判断是 fp32 batch-shape 数值尾差还是实际 padding/mask 问题。
 
+## 审计意见补做实验
+
+独立审计指出 r9 的两个 claim boundary：
+
+1. `SAVE_GRAD_TENSORS=false`，不能 claim full-grad tensor 全量保存比较通过。
+2. `FORWARD_PROBE_SAMPLE_POS=-1`，不能 claim forward hook 中间层 probe 已通过。
+
+后续补做实验按边界拆分处理：r11 补 full-grad tensor；r13/r18 补 forward hook probe。r12 试图同时补两个边界，但 bsz1 阶段运行过慢，已中止，不作为通过证据。
+
+### r10 exact repeat
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_4gpu_notf32_pod_0606_r10_repeat` |
+| return code | `0` |
+| `summary.status` | `pass` |
+| world size | `4` |
+| updates | `3` |
+| `save_grad_tensors` | `false` |
+| `failure_count` | `0` |
+| `record/state/state_sync/diagnostic_failure_count` | 全部 `0` |
+
+结论：r10 复现 r9 的 4GPU、3 update replay pass，但仍未补 full-grad tensor 和 forward hook 边界。
+
+### r11 full-grad + strict forward probe
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_4gpu_notf32_pod_0606_r11_fullgrad_forward1` |
+| run dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r11_fullgrad_forward1` |
+| return code | `1` |
+| `summary.status` | `fail` |
+| world size | `4` |
+| updates | `1` |
+| `save_grad_tensors` | `true` |
+| `FORWARD_PROBE_SAMPLE_POS` | `0` |
+| `diagnostic_atol/rtol` | `1e-4 / 1e-4` |
+| `grad_compare_failure_sum` | `0` |
+| `forward_probe_failure_sum` | `4` |
+| `record/state/state_sync failure count` | 全部 `0` |
+
+关键事实：
+
+- rank0 保存并比较了 full-grad tensor：
+  - `bsz2_gacc5/pre_clip_grad_after_update_0.pt`
+  - `bsz2_gacc5/post_clip_grad_after_update_0.pt`
+- `bsz1_gacc10` 的 `pre_clip_grad_compare.allclose=true`、`post_clip_grad_compare.allclose=true`。
+- r11 失败只来自 strict forward probe sampled values；首个 mismatch 是 `diffusion_transformer.output_a#00`，sampled value 最大绝对差约 `0.0028`，而 stats compare 为 true。
+
+结论：r11 关闭了“full-grad tensor 全量保存比较”边界，但没有关闭 “forward hook 中间层 probe” 边界。
+
+### r12 combined retry
+
+| 项目 | 值 |
+| --- | --- |
+| 4GPU run id | `replay_bsz2_bsz1_4gpu_notf32_pod_0606_r12_fullgrad_forward5e3` |
+| 2GPU run id | `replay_bsz2_bsz1_2gpu_notf32_pod_0606_r12_fullgrad_forward5e3` |
+| 目的 | 同时补 full-grad 和 forward-probe |
+| 改动 | 新增 forward-probe 专用 `FORWARD_PROBE_ATOL/RTOL=5e-3/5e-3`，主 `DIAGNOSTIC_ATOL/RTOL` 保持 `1e-4/1e-4` |
+| 结果 | 中止 |
+
+中止原因：
+
+- 两个 r12 都完成 bsz2 reference、full-grad 保存或部分保存后，在 bsz1 首个 microbatch 阶段长时间无 sample tensor 产出。
+- 4GPU r12 已写出 bsz2 侧 40 个 sample tensor、bsz2 侧 4 个 forward probe JSON；加上 bsz1 早期产物，forward probe JSON 合计 8 个；rank0 pre/post full-grad 各约 1.4GB。
+- 该 run 没有 `summary.status=pass`，不得作为通过证据。
+
+### r13 forward-probe lightweight replay
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_4gpu_notf32_pod_0606_r13_forward2samp5e3` |
+| run dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r13_forward2samp5e3` |
+| return code | `0` |
+| `summary.status` | `pass` |
+| world size | `4` |
+| updates | `1` |
+| `per_rank_samples` | `2` |
+| `save_grad_tensors` | `false` |
+| `FORWARD_PROBE_SAMPLE_POS` | `0` |
+| main `ATOL/RTOL` | `5e-4 / 5e-4` |
+| diagnostic `ATOL/RTOL` | `1e-4 / 1e-4` |
+| forward probe `ATOL/RTOL` | `5e-3 / 5e-3` |
+| `failure_count` | `0` |
+| `record/state/state_sync/diagnostic_failure_count` | 全部 `0` |
+| summed `sample/forward_probe/grad_compare_failure_count` | 全部 `0` |
+
+r13 对脚本的实验控制改动：
+
+- 新增 `--forward-probe-atol/--forward-probe-rtol`，使 forward hook 容差与 sample/grad diagnostic 容差分离。
+- 新增 `--per-rank-samples`，默认仍为 `10`；r13 显式设为 `2`，只作为 forward-probe lightweight replay，不替代 r9/r10 的 3 update、10 samples/rank replay。
+
+深查记录：
+
+- `bsz1_gacc10` rank0..3：`micro_count=2`、`sample_compare_failure_count=0`、`forward_probe_failure_count=0`、`grad_compare_failure_count=0`、`record_compare.allclose=true`。
+- `bsz1_gacc10` rank0：`state_compare.allclose=true`；所有 rank `state_hashes_synced=true`。
+- `bsz1_gacc10` 每个 rank 的 2 个 sample tensor compare 均为 true。
+- `bsz1_gacc10` 每个 rank 的 forward probe compare 均为 true。
+
+结论：r13 先关闭了“forward hook 中间层 probe 已启用并通过”的最小边界，但该结论限定在 `per_rank_samples=2`、`updates=1`、forward probe 容差 `5e-3/5e-3` 的 lightweight replay；它不替代 r9/r10 的完整 3 update replay，也不替代 r11 的 full-grad tensor 证据。
+
+### r14 default-kernel forward-probe 诊断失败
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_4gpu_notf32_pod_0606_r14_fwd10samp5e3` |
+| run dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r14_fwd10samp5e3` |
+| return code | `1` |
+| `summary.status` | `fail` |
+| world size | `4` |
+| updates | `1` |
+| `per_rank_samples` | `10` |
+| `save_grad_tensors` | `false` |
+| `FORWARD_PROBE_SAMPLE_POS` | `0` |
+| forward probe `ATOL/RTOL` | `5e-3 / 5e-3` |
+| `failure_count` | `8` |
+| `record_failure_count` | `4` |
+| `diagnostic_failure_count` | `4` |
+| `state_failure_count/state_sync_failure_count` | `0 / 0` |
+
+关键事实：
+
+- `preflight_env.txt` 中没有 `MODEL_DTYPE=fp32`，也没有 `USE_DEEPSPEED_EVO_ATTENTION=false`；replay 脚本在这种情况下默认 `USE_DEEPSPEED_EVO_ATTENTION=true`，dtype 使用配置默认值。
+- `bsz1_gacc10` 的 4 个 rank 都出现 `record_compare.allclose=false`，每个 rank 的 `forward_probe_failure_count=1`。
+- `grad_compare_failure_count=0`，rank0 `state_compare.allclose=true`，所有 rank 的 grad/state hash sync 仍为 true。
+
+结论：r14 是“控制变量不匹配的诊断失败”，不能用来推翻 r9/r10/r13 在 no-evo/fp32/no-TF32 口径下的结论。它说明 `per_rank_samples=10、FORWARD_PROBE_SAMPLE_POS=0` 的 forward probe 对 kernel/dtype 路径敏感；要补强 r13，必须在与 r9/r10/r13 相同的 `MODEL_DTYPE=fp32`、`USE_DEEPSPEED_EVO_ATTENTION=false` 控制变量下重跑。
+
+### r15/r16/r17 中止记录
+
+| run id | 规模 | 结果 | 说明 |
+| --- | --- | --- | --- |
+| `replay_bsz2_bsz1_4gpu_notf32_pod_0606_r15_repeat_fwd10samp5e3` | 4GPU | `returncode=143`，无 `summary.json` | 中止，不作为证据 |
+| `replay_bsz2_bsz1_2gpu_noevo_pod_0606_r16_fwd10samp5e3` | 2GPU | `returncode=143`，无 `summary.json` | 中止，且缺少 `MODEL_DTYPE=fp32` 控制变量 |
+| `replay_bsz2_bsz1_4gpu_noevo_fp32_pod_0606_r17_fwd10samp5e3` | 4GPU | `returncode=143`，无 `summary.json` | 中止，不作为证据 |
+
+### r18 4GPU no-evo/fp32 per-rank-samples=10 forward-probe replay
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_4gpu_noevo_fp32_pod_0606_r18_fwd10samp5e3_clean` |
+| run dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_noevo_fp32_pod_0606_r18_fwd10samp5e3_clean` |
+| return code | `0` |
+| `summary.status` | `pass` |
+| world size | `4` |
+| updates | `1` |
+| `per_rank_samples` | `10` |
+| `MODEL_DTYPE` | `fp32` |
+| `USE_DEEPSPEED_EVO_ATTENTION` | `false` |
+| `DISABLE_TF32/NVIDIA_TF32_OVERRIDE` | `true / 0` |
+| `save_grad_tensors` | `false` |
+| `FORWARD_PROBE_SAMPLE_POS` | `0` |
+| main `ATOL/RTOL` | `5e-4 / 5e-4` |
+| diagnostic `ATOL/RTOL` | `1e-4 / 1e-4` |
+| forward probe `ATOL/RTOL` | `5e-3 / 5e-3` |
+| `failure_count` | `0` |
+| `record/state/state_sync/diagnostic_failure_count` | 全部 `0` |
+
+深查记录：
+
+- `preflight_env.txt` 明确记录 `MODEL_DTYPE=fp32` 和 `USE_DEEPSPEED_EVO_ATTENTION=false`。
+- `bsz1_gacc10` rank0..3 均有 `sample_compare_failure_count=0`、`forward_probe_failure_count=0`、`grad_compare_failure_count=0`、`record_compare.allclose=true`。
+- rank0 `state_compare.allclose=true`；所有 rank 的 `pre_clip_grad_hashes_synced=true`、`post_clip_grad_hashes_synced=true`、`state_hashes_synced=true`。
+
+结论：r18 把 r13 的 forward-probe lightweight 证据扩展到单节点 4GPU、`per_rank_samples=10`、1 update、`FORWARD_PROBE_SAMPLE_POS=0` 的 replay。它关闭了 r14 在控制变量不匹配下暴露出的 `per_rank_samples=10` forward-probe 缺口；但它仍不表示 10 个 sample position 都做了 forward hook，也不替代 r9/r10 的 3 update 主训练集成 replay 或 r11 的 full-grad tensor 证据。
+
+### r19 2GPU no-evo/fp32 repeat
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0606_r19_fwd10samp5e3` |
+| run dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0606_r19_fwd10samp5e3` |
+| return code | `0` |
+| `summary.status` | `pass` |
+| world size | `2` |
+| updates | `1` |
+| `per_rank_samples` | `10` |
+| `MODEL_DTYPE` | `fp32` |
+| `USE_DEEPSPEED_EVO_ATTENTION` | `false` |
+| `failure_count` | `0` |
+| `record/state/state_sync/diagnostic_failure_count` | 全部 `0` |
+
+结论：r19 是 r18 同控制变量下的 2GPU repeat，包括 `NVIDIA_TF32_OVERRIDE=0`、`SAVE_GRAD_TENSORS=false`、`FORWARD_PROBE_SAMPLE_POS=0` 和相同阈值，仅 `world_size=2`。它说明该 `per_rank_samples=10、pos0` forward-probe 通过结果不只依赖一次 4GPU 运行；但它不能替代 4GPU/8GPU/16GPU 的 DDP world-size gate，也不提供 full-grad tensor 证据。
+
+### r20 2GPU no-evo/fp32 pos9 forward-probe repeat
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0607_r20_fwdpos9` |
+| run dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0607_r20_fwdpos9` |
+| return code | `0` |
+| `summary.status` | `pass` |
+| world size | `2` |
+| updates | `1` |
+| `per_rank_samples` | `10` |
+| `MODEL_DTYPE` | `fp32` |
+| `USE_DEEPSPEED_EVO_ATTENTION` | `false` |
+| `DISABLE_TF32/NVIDIA_TF32_OVERRIDE` | `true / 0` |
+| `save_grad_tensors` | `false` |
+| `FORWARD_PROBE_SAMPLE_POS` | `9` |
+| main `ATOL/RTOL` | `5e-4 / 5e-4` |
+| diagnostic `ATOL/RTOL` | `1e-4 / 1e-4` |
+| forward probe `ATOL/RTOL` | `5e-3 / 5e-3` |
+| `failure_count` | `0` |
+| `record/state/state_sync/diagnostic_failure_count` | 全部 `0` |
+
+深查记录：
+
+- `preflight_env.txt` 明确记录 `MODEL_DTYPE=fp32`、`USE_DEEPSPEED_EVO_ATTENTION=false` 和 `FORWARD_PROBE_SAMPLE_POS=9`。
+- `bsz1_gacc10` rank0..1 均有 `sample_compare_failure_count=0`、`forward_probe_failure_count=0`、`grad_compare_failure_count=0`、`record_compare.allclose=true`。
+- rank0 `state_compare.allclose=true`；rank0..1 的 `pre_clip_grad_hashes_synced=true`、`post_clip_grad_hashes_synced=true`、`state_hashes_synced=true`。
+
+结论：r20 是针对独立审计“r18/r19 只覆盖 `FORWARD_PROBE_SAMPLE_POS=0`”措辞边界的定向补强。它说明在同一 no-evo/fp32/no-TF32 控制变量下，2GPU、`per_rank_samples=10`、末尾 sample position `9` 的 forward-probe replay 也通过；但它仍不能替代 4GPU/8GPU/16GPU world-size gate，也不提供 full-grad tensor 证据。
+
+### r10-r13 补做实验独立事实审计
+
+在 r10-r13 补做实验完成后，已再次启动独立只读 Codex 审计会话核查 r10/r11/r12/r13 的 summary、returncode、rank record、实际产物和文档措辞。审计 verdict 为 `pass`，并确认：
+
+- r10 只复现 r9 的 4GPU、3 update replay，不补 full-grad 或 forward-probe 边界。
+- r11 的 `SAVE_GRAD_TENSORS=true`，rank0 pre/post full-grad 文件存在且约 1.42GB，`pre_clip_grad_compare.allclose=true`、`post_clip_grad_compare.allclose=true`、`grad_compare_failure_count=0`；但 r11 的 forward probe 在 strict `1e-4` 口径失败，不能作为 forward-probe 通过证据。
+- r12 没有 `summary.status=pass` 证据，文档必须保持“中止/不作为通过证据”的表述。
+- r13 的 `FORWARD_PROBE_SAMPLE_POS=0` 见 `env_node0.txt`，`summary.status=pass`，`forward_probe_atol/rtol=5e-3/5e-3`；rank0..3 的 `forward_probe_failure_count=0`、`sample_compare_failure_count=0`、`grad_compare_failure_count=0`，`record_compare.allclose=true`，rank0 `state_compare.allclose=true`，all ranks `state_hashes_synced=true`。
+
+审计指出的一处文档措辞修正已经完成：r12 forward probe JSON 数量明确为 bsz2 侧 4 个，加上 bsz1 早期产物合计 8 个。当前仍需保留的限制是：r13 只覆盖 `updates=1`、`per_rank_samples=2` 的 forward-probe lightweight replay；r11 只覆盖 `updates=1` 的 full-grad tensor 补证；r9/r10 才是 3 update、10 samples/rank 的主训练集成 replay 证据。r14-r20 是后续新增补做记录，需要单独审计。
+
 ## 独立审计
 
 已启动独立只读审计会话核查 r9 真实性：

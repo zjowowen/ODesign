@@ -539,11 +539,13 @@ bsz1 path:
 
 ## 阶段二：当前 Replay 诊断证据
 
-截至 2026-06-06，阶段二 replay 的最新结论是：
+截至 2026-06-07，阶段二 replay 的最新结论是：
 
 > 真实样本 replay 中，默认 H200/TF32 数值路径会让 batch shape 不同的 `bsz2` 和 `bsz1` 运行在 `InputFeatureEmbedder.atom_attention_encoder` 内出现 `1e-5 ~ 1e-4` 级差异；关闭 TF32 后，该首个发散点降到 fp32 尾差量级。因此当前主要问题不是 padding 输入错位，而是严格等价 replay 对 CUDA/TF32 batch-shape 数值差异非常敏感。
 >
 > 在 no-TF32/fp32、禁用 permutation、固定 MSA rows、真实 `35999.pt` checkpoint 和真实样本 trace 下，最新 4GPU DDP replay 已经在 `ATOL/RTOL=5e-4`、`DIAGNOSTIC_ATOL/RTOL=1e-4`、3 个 optimizer update 上通过。这个结论支持“训练集成层面 bsz2 与 bsz1 等价”，但不声称 bitwise 或 `1e-6` 级 strict replay 等价。
+>
+> 审计指出的两个 r9 边界已经拆分补证：r11 在 4GPU、1 update 下保存并比较 pre/post full-grad tensor 且 grad compare failure 为 0；r13 在 4GPU、`per_rank_samples=2`、1 update 下启用 forward hook probe，并在 forward-probe 专用 `ATOL/RTOL=5e-3` 下通过；r18 进一步在 4GPU、`per_rank_samples=10`、1 update、`FORWARD_PROBE_SAMPLE_POS=0`、no-evo/fp32/no-TF32 控制变量下通过 forward-probe replay；r20 在 2GPU、同控制变量、`FORWARD_PROBE_SAMPLE_POS=9` 下通过。r13/r18/r20 是 forward-probe 证据，不替代 r9/r10 的 3 update replay；r11 是 full-grad tensor 证据，但 strict forward probe 在 `1e-4` sampled-value 阈值下仍失败。
 
 已核验的证据链：
 
@@ -672,7 +674,92 @@ bsz1 path:
    - 结论：
      这是当前阶段二最强的单节点 4GPU DDP replay 证据。它把 r6 中 `2e-5` diagnostic 阈值下的 sample tensor 尾差，收敛为 `1e-4` diagnostic 阈值下的完整 3 update 通过；主训练 record、state、grad summary、sample tensor 和 DDP 同步 hash 均未出现 failure。r9 未启用 forward probe，若要补强中间层 forward tensor 证据，需要另跑 forward-probe repeat。
 
-7. r7 no-TF32 16GPU DDP replay 提交合同：
+7. r10 exact repeat：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r10_repeat`
+   - 运行配置：
+     与 r9 相同的 `world_size=4`、`UPDATES=3`、`TRACE_SEED=20260605`、主阈值 `5e-4`、diagnostic 阈值 `1e-4`，仍为 `SAVE_GRAD_TENSORS=false`、`FORWARD_PROBE_SAMPLE_POS=-1`。
+   - 最终结果：
+     `returncode_node0.txt = 0`，`summary.status = pass`，`failure_count = 0`，`record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`，`diagnostic_failure_count = 0`。
+   - 结论：
+     r10 复现 r9 结论，证明 r9 不是单次偶发；但它不补 full-grad tensor 和 forward hook 边界。
+
+8. r11 full-grad + strict forward probe：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r11_fullgrad_forward1`
+   - 运行配置：
+     `world_size=4`，`UPDATES=1`，`SAVE_GRAD_TENSORS=true`，`FORWARD_PROBE_SAMPLE_POS=0`，主阈值 `5e-4`，diagnostic 阈值 `1e-4`。
+   - 最终结果：
+     `summary.status = fail`，但 `record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`，`grad_compare_failure_sum = 0`。
+   - 失败来源：
+     `forward_probe_failure_sum = 4`，首个 mismatch 为 `diffusion_transformer.output_a#00`，sampled value 最大绝对差约 `0.0028`，stats compare 仍为 true。
+   - 结论：
+     r11 关闭 full-grad tensor 全量保存比较边界；不能作为 forward hook probe 通过证据。
+
+9. r13 forward-probe lightweight replay：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r13_forward2samp5e3`
+   - 运行配置：
+     `world_size=4`，`UPDATES=1`，`PER_RANK_SAMPLES=2`，`SAVE_GRAD_TENSORS=false`，`FORWARD_PROBE_SAMPLE_POS=0`，主阈值 `5e-4`，sample/grad diagnostic 阈值 `1e-4`，forward probe 专用阈值 `5e-3`。
+   - 最终结果：
+     `returncode_node0.txt = 0`，`summary.status = pass`，`failure_count = 0`，`diagnostic_failure_count = 0`，`record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`。
+   - 深查结果：
+     `bsz1_gacc10` rank0..3 均有 `sample_compare_failure_count = 0`，`forward_probe_failure_count = 0`，`grad_compare_failure_count = 0`，`record_compare.allclose = true`；rank0 `state_compare.allclose = true`。
+   - 结论：
+     r13 先关闭 forward hook 中间层 probe 最小边界；但该结论限定为 4GPU lightweight replay，不能替代 r9/r10 的 3 update、10 samples/rank replay，也不能替代 r11 的 full-grad tensor 证据。
+
+10. r14 default-kernel forward-probe 诊断失败：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r14_fwd10samp5e3`
+   - 运行配置：
+     `world_size=4`，`UPDATES=1`，`PER_RANK_SAMPLES=10`，`SAVE_GRAD_TENSORS=false`，`FORWARD_PROBE_SAMPLE_POS=0`，主阈值 `5e-4`，sample/grad diagnostic 阈值 `1e-4`，forward probe 专用阈值 `5e-3`。`preflight_env.txt` 没有 `MODEL_DTYPE=fp32`，也没有 `USE_DEEPSPEED_EVO_ATTENTION=false`。
+   - 最终结果：
+     `returncode_node0.txt = 1`，`summary.status = fail`，`failure_count = 8`，`record_failure_count = 4`，`diagnostic_failure_count = 4`，`state_failure_count = 0`，`state_sync_failure_count = 0`。
+   - 深查结果：
+     `bsz1_gacc10` rank0..3 均有 `record_compare.allclose = false`，每个 rank 的 `forward_probe_failure_count = 1`；`grad_compare_failure_count = 0`，rank0 `state_compare.allclose = true`，all-rank grad/state hash sync 均为 true。
+   - 结论：
+     r14 是控制变量不匹配的诊断失败，不作为 no-evo/fp32/no-TF32 口径的反证。它说明 `per_rank_samples=10、FORWARD_PROBE_SAMPLE_POS=0` 的 forward probe 对 dtype/kernel 路径敏感，需要用 r18 这类同控制变量 repeat 补证。
+
+11. r15/r16/r17 中止记录：
+   - r15 `replay_bsz2_bsz1_4gpu_notf32_pod_0606_r15_repeat_fwd10samp5e3`、r16 `replay_bsz2_bsz1_2gpu_noevo_pod_0606_r16_fwd10samp5e3`、r17 `replay_bsz2_bsz1_4gpu_noevo_fp32_pod_0606_r17_fwd10samp5e3` 均为人为中止或污染清理相关运行，`returncode=143` 且没有 `summary.json`。
+   - 结论：
+     这些 run 不作为通过或失败证据；r16 还缺少 `MODEL_DTYPE=fp32` 控制变量。
+
+12. r18 4GPU no-evo/fp32 per-rank-samples=10 forward-probe replay：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_noevo_fp32_pod_0606_r18_fwd10samp5e3_clean`
+   - 运行配置：
+     `world_size=4`，`UPDATES=1`，`PER_RANK_SAMPLES=10`，`MODEL_DTYPE=fp32`，`USE_DEEPSPEED_EVO_ATTENTION=false`，`DISABLE_TF32=true`，`NVIDIA_TF32_OVERRIDE=0`，`SAVE_GRAD_TENSORS=false`，`FORWARD_PROBE_SAMPLE_POS=0`，主阈值 `5e-4`，sample/grad diagnostic 阈值 `1e-4`，forward probe 专用阈值 `5e-3`。
+   - 最终结果：
+     `returncode_node0.txt = 0`，`summary.status = pass`，`failure_count = 0`，`diagnostic_failure_count = 0`，`record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`。
+   - 深查结果：
+     `bsz1_gacc10` rank0..3 均有 `sample_compare_failure_count = 0`，`forward_probe_failure_count = 0`，`grad_compare_failure_count = 0`，`record_compare.allclose = true`；rank0 `state_compare.allclose = true`；所有 rank 的 pre/post grad hash 和 state hash sync 均为 true。
+   - 结论：
+     r18 将 forward-probe 补证从 r13 的 `per_rank_samples=2` 扩展到 4GPU、`per_rank_samples=10`、1 update、`FORWARD_PROBE_SAMPLE_POS=0`；但它不表示 10 个 sample position 都做了 forward hook，也不替代 r9/r10 的 3 update 主 replay 或 r11 的 full-grad tensor 证据。
+
+13. r19 2GPU no-evo/fp32 repeat：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0606_r19_fwd10samp5e3`
+   - 运行配置：
+     `world_size=2`，`UPDATES=1`，`PER_RANK_SAMPLES=10`，`MODEL_DTYPE=fp32`，`USE_DEEPSPEED_EVO_ATTENTION=false`，`DISABLE_TF32=true`，`FORWARD_PROBE_SAMPLE_POS=0`，forward probe 专用阈值 `5e-3`。
+   - 最终结果：
+     `returncode_node0.txt = 0`，`summary.status = pass`，`failure_count = 0`，`record/state/state_sync/diagnostic_failure_count` 全部为 0。
+   - 结论：
+     r19 是 r18 同控制变量下的 2GPU repeat，包括 `NVIDIA_TF32_OVERRIDE=0`、`SAVE_GRAD_TENSORS=false`、`FORWARD_PROBE_SAMPLE_POS=0` 和相同阈值，仅 `world_size=2`；它支持 r18 的可靠性，但不能替代 4GPU/8GPU/16GPU world-size gate，也不提供 full-grad tensor 证据。
+
+14. r20 2GPU no-evo/fp32 pos9 forward-probe repeat：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_2gpu_noevo_fp32_pod_0607_r20_fwdpos9`
+   - 运行配置：
+     `world_size=2`，`UPDATES=1`，`PER_RANK_SAMPLES=10`，`MODEL_DTYPE=fp32`，`USE_DEEPSPEED_EVO_ATTENTION=false`，`DISABLE_TF32=true`，`NVIDIA_TF32_OVERRIDE=0`，`SAVE_GRAD_TENSORS=false`，`FORWARD_PROBE_SAMPLE_POS=9`，主阈值 `5e-4`，sample/grad diagnostic 阈值 `1e-4`，forward probe 专用阈值 `5e-3`。
+   - 最终结果：
+     `returncode_node0.txt = 0`，`summary.status = pass`，`failure_count = 0`，`diagnostic_failure_count = 0`，`record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`。
+   - 深查结果：
+     `bsz1_gacc10` rank0..1 均有 `sample_compare_failure_count = 0`，`forward_probe_failure_count = 0`，`grad_compare_failure_count = 0`，`record_compare.allclose = true`；rank0 `state_compare.allclose = true`；rank0..1 的 pre/post grad hash 和 state hash sync 均为 true。
+   - 结论：
+     r20 是针对 `FORWARD_PROBE_SAMPLE_POS=0` 覆盖边界的定向补强，说明 2GPU、`per_rank_samples=10`、末尾 sample position `9` 也通过；但它不能替代 4GPU/8GPU/16GPU world-size gate，也不提供 full-grad tensor 证据。
+
+15. r7 no-TF32 16GPU DDP replay 提交合同：
    - H200 job：
      `zjow-odesign-replay16g-notf32-0606-r7`
    - 提交时间：
@@ -704,7 +791,7 @@ bsz1 path:
    - 当前状态：
      `Inqueue`，两个 replica 均为 `STARTING/Pending`；事件为 `pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable`。这表示 gang 调度尚未拿到两台 8GPU 节点，不是 user code 或 runner 启动失败。
 
-8. r8 no-TF32 8GPU 单节点 engineering replay 提交合同：
+16. r8 no-TF32 8GPU 单节点 engineering replay 提交合同：
    - H200 job：
      `zjow-odesign-replay8g-notf32-0606-r1`
    - 提交时间：
@@ -742,8 +829,11 @@ bsz1 path:
 - r4 说明默认 replay 失败中的大差异主要来自 TF32/batch-shape 触发的不同 kernel 或累加路径。
 - r5 说明在 no-TF32/fp32 下，完整 pre-clip grad 的剩余最坏差异约为 `1.4e-5`，post-clip grad、state、record、sample tensor 和 forward probe 在当前口径下通过。
 - r6 说明 4GPU DDP 下每 rank 的 record/state/grad summary 和 DDP 同步 hash 在主阈值下通过；但 strict forward/sample diagnostic 仍会看到 `1e-4` 量级以内的 shape-sensitive fp32 差异。
-- r9 说明在 no-TF32/fp32、单节点 4GPU DDP、3 update、`diagnostic_atol/rtol=1e-4` 下，bsz2 与 bsz1 replay 已经完整通过；这是当前训练集成层面的主要通过证据。
-- 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议将 `2e-5` 视为真实大模型 CUDA fp32 full-grad 路径的强诊断阈值，将 `1e-4` 视为单节点 DDP forward/sample 诊断阈值，将 `5e-4` 作为训练集成层面的主阈值。
+- r9/r10 说明在 no-TF32/fp32、单节点 4GPU DDP、3 update、`diagnostic_atol/rtol=1e-4` 下，bsz2 与 bsz1 replay 已经完整通过；这是当前训练集成层面的主要通过证据。
+- r11 说明 4GPU、1 update 下 pre/post full-grad tensor 全量保存比较通过，关闭了 r9 中 `SAVE_GRAD_TENSORS=false` 的审计边界。
+- r13 说明 4GPU、1 update、`per_rank_samples=2` 下 forward hook 中间层 probe 通过；r18 进一步说明同一 no-evo/fp32/no-TF32 控制变量下，4GPU、1 update、`per_rank_samples=10`、`FORWARD_PROBE_SAMPLE_POS=0` 的 forward-probe replay 也通过；r20 说明 2GPU、同控制变量、`FORWARD_PROBE_SAMPLE_POS=9` 也通过。三者共同补上 r9 未启用 forward-probe 的证据，其中 r18 覆盖 4GPU pos0，r20 仅作为 2GPU pos9 定向补强；该证据仍不覆盖所有 sample position，也不覆盖 3 update forward-probe；该结论使用 forward-probe 专用 `ATOL/RTOL=5e-3`。
+- r14 说明如果缺少 `MODEL_DTYPE=fp32` 和 `USE_DEEPSPEED_EVO_ATTENTION=false` 这些控制变量，`per_rank_samples=10、FORWARD_PROBE_SAMPLE_POS=0` 的 forward probe 会失败；它是 dtype/kernel 敏感性的诊断信号，不是 padding batch 改造的反证。
+- 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议将 `2e-5` 视为真实大模型 CUDA fp32 full-grad 路径的强诊断阈值，将 `1e-4` 视为单节点 DDP sample/grad 诊断阈值，将 `5e-3` 视为深层 forward hook sampled-value spot check 的当前工程容差，将 `5e-4` 作为训练集成层面的主阈值。
 - 对正式训练，TF32 可以作为性能路径保留，但不能期望 `bsz2` 与 `bsz1` 在 `1e-6` 级别严格 replay 等价。正式训练应更多依赖 loss/grad/state 的合理容差和后续 PBP/ODesignBench 指标，而不是 bitwise 或 near-bitwise 等价。
 
 尚未完成的边界：
@@ -751,7 +841,9 @@ bsz1 path:
 - r4 的最终状态仍是 `status=fail`，不能宣称 strict replay 已完全通过；但失败口径已经从默认 TF32 下的 `1e-4` 级首个发散，收敛为 no-TF32/fp32 下的 `1e-6 ~ 1e-5` 级尾差。
 - r5 已保存并比较完整 pre-clip/post-clip grad tensor，但仍只覆盖 1GPU、1 update、permutation disabled、deterministic MSA rows 的诊断配置。
 - r6 已覆盖单节点 4GPU DDP 的更严格 `2e-5` diagnostic 口径，但未通过 strict forward/sample diagnostic。
-- r9 已覆盖单节点 4GPU DDP、3 update 和 `1e-4` diagnostic 通过，但未保存完整 per-rank grad tensors；当前不能说 full-grad tensor 在 4GPU 每个 rank 上逐参数全量保存比较通过。
+- r9/r10 已覆盖单节点 4GPU DDP、3 update 和 `1e-4` diagnostic 通过，但 r9/r10 本身未保存完整 grad tensor、也未启用 forward probe；这些边界分别由 r11 和 r13 补证。
+- r11 的 full-grad tensor 证据只覆盖 4GPU、1 update，不覆盖 3 update full-grad tensor 全量保存。
+- r13 的 forward-probe 证据只覆盖 4GPU、1 update、`per_rank_samples=2` 的 lightweight replay；r18 已补到 4GPU、1 update、`per_rank_samples=10`、`FORWARD_PROBE_SAMPLE_POS=0`；r20 已补到 2GPU、1 update、`per_rank_samples=10`、`FORWARD_PROBE_SAMPLE_POS=9`。这些仍不覆盖所有 sample position，也不覆盖 3 update 全长度 forward-probe replay。
 - r7 16GPU DDP replay 已提交并通过 dry-run/runtime preflight，但截至 `2026-06-06 19:34 +0800` 仍在排队；当前尚未覆盖正式 world size 和跨节点通信的实际执行结果。
 - r8 8GPU 单节点 engineering replay 已提交并通过 dry-run，但截至 `2026-06-06 19:34 +0800` 仍在排队；它即使完成，也只能作为单节点 8 rank 工程信号，不能替代 r7。
 
@@ -819,4 +911,4 @@ bsz1 path:
 - 已有 replay 结果显示只看参数更新不足够。曾出现 `state_compare allclose=True` 但 `loss` 和 `grad_summary` 不 allclose。
 - 早期 replay 曾指向 `weighted_smooth_lddt_loss` 是主要差异项，但后续 forward hook 进一步显示，loss 差异之前已经存在 `pred_coordinate`/trunk 表征差异。
 - r3/r4 诊断把首个大差异定位到默认 H200/TF32 数值路径下的 `InputFeatureEmbedder.atom_attention_encoder` 输出；关闭 TF32 后该差异降至 fp32 尾差量级。
-- 接下来阶段二应使用 no-TF32/fp32 诊断配置完成完整 replay summary，再扩展到 4GPU/16GPU DDP replay。正式训练可以使用性能配置，但 strict replay 不能用 TF32 路径判定 padding 逻辑是否等价。
+- r9/r10 已在 no-TF32/fp32/no-evo 控制变量下完成 4GPU、3 update 主 replay；r11 补 full-grad tensor 1 update；r18 补 4GPU、`per_rank_samples=10`、1 update、`FORWARD_PROBE_SAMPLE_POS=0` forward-probe replay；r20 补 2GPU、`FORWARD_PROBE_SAMPLE_POS=9` repeat。接下来阶段二的主要缺口是 8GPU/16GPU world-size gate，以及如果需要更强证据时补更多 sample position 的 forward-probe sweep、3 update forward-probe 或 3 update full-grad tensor 组合。正式训练可以使用性能配置，但 strict replay 不能用 TF32 路径判定 padding 逻辑是否等价。
