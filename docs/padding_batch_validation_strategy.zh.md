@@ -645,6 +645,7 @@ bsz1 path:
    - 运行载体：
      长时 4GPU 交互容器 `zjow-sci2-bs-pbp-4gpu-clone20260606162737-59667537-2g4sk`。
    - 环境控制：
+     `SMOKE_MODE=1`，
      `world_size=4`，
      `MODEL_DTYPE=fp32`，
      `NVIDIA_TF32_OVERRIDE=0`，
@@ -665,11 +666,11 @@ bsz1 path:
      - `world_size = 4`，`updates = 3`。
      - `failure_count = 0`。
      - `record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`，`diagnostic_failure_count = 0`。
-     - `bsz1_gacc10` 的 4 个 rank 均有 3 条 records；每个 rank 的最后一个 update 都满足 `record_compare.allclose = true`，`diagnostic_failure_count = 0`，`sample_compare_failure_count = 0`，`grad_compare_failure_count = 0`，`state_hashes_synced = true`。
+     - `bsz1_gacc10` 的 4 个 rank 均有 3 条 records；每个 rank 的最后一条 record（`update_idx = 2`）都满足 `record_compare.allclose = true`，`diagnostic_failure_count = 0`，`sample_compare_failure_count = 0`，`grad_compare_failure_count = 0`，`state_hashes_synced = true`。
      - `FORWARD_PROBE_SAMPLE_POS=-1`，因此 r9 未启用 forward hook 细粒度 probe；`forward_probe_failure_count = 0` 只能说明没有 forward probe failure，不能作为 forward probe 通过证据。
      - rank0 的 `state_compare.allclose = true` 覆盖 3 个 update；非 rank0 不重复保存完整 state compare，但 all-rank state hash 同步。
    - 结论：
-     这是当前阶段二最强的单节点 DDP replay 证据。它把 r6 中 `2e-5` diagnostic 阈值下的 sample tensor 尾差，收敛为 `1e-4` diagnostic 阈值下的完整 3 update 通过；主训练 record、state、grad summary、sample tensor 和 DDP 同步 hash 均未出现 failure。r9 未启用 forward probe，若要补强中间层 forward tensor 证据，需要另跑 forward-probe repeat。
+     这是当前阶段二最强的单节点 4GPU DDP replay 证据。它把 r6 中 `2e-5` diagnostic 阈值下的 sample tensor 尾差，收敛为 `1e-4` diagnostic 阈值下的完整 3 update 通过；主训练 record、state、grad summary、sample tensor 和 DDP 同步 hash 均未出现 failure。r9 未启用 forward probe，若要补强中间层 forward tensor 证据，需要另跑 forward-probe repeat。
 
 7. r7 no-TF32 16GPU DDP replay 提交合同：
    - H200 job：
@@ -741,7 +742,7 @@ bsz1 path:
 - r4 说明默认 replay 失败中的大差异主要来自 TF32/batch-shape 触发的不同 kernel 或累加路径。
 - r5 说明在 no-TF32/fp32 下，完整 pre-clip grad 的剩余最坏差异约为 `1.4e-5`，post-clip grad、state、record、sample tensor 和 forward probe 在当前口径下通过。
 - r6 说明 4GPU DDP 下每 rank 的 record/state/grad summary 和 DDP 同步 hash 在主阈值下通过；但 strict forward/sample diagnostic 仍会看到 `1e-4` 量级以内的 shape-sensitive fp32 差异。
-- r9 说明在 no-TF32/fp32、4GPU DDP、3 update、`diagnostic_atol/rtol=1e-4` 下，bsz2 与 bsz1 replay 已经完整通过；这是当前训练集成层面的主要通过证据。
+- r9 说明在 no-TF32/fp32、单节点 4GPU DDP、3 update、`diagnostic_atol/rtol=1e-4` 下，bsz2 与 bsz1 replay 已经完整通过；这是当前训练集成层面的主要通过证据。
 - 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议将 `2e-5` 视为真实大模型 CUDA fp32 full-grad 路径的强诊断阈值，将 `1e-4` 视为单节点 DDP forward/sample 诊断阈值，将 `5e-4` 作为训练集成层面的主阈值。
 - 对正式训练，TF32 可以作为性能路径保留，但不能期望 `bsz2` 与 `bsz1` 在 `1e-6` 级别严格 replay 等价。正式训练应更多依赖 loss/grad/state 的合理容差和后续 PBP/ODesignBench 指标，而不是 bitwise 或 near-bitwise 等价。
 
