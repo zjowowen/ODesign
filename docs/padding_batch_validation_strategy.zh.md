@@ -635,6 +635,70 @@ bsz1 path:
      - 4 个 rank 的 `pre_clip_grad_hashes_synced = true`，`post_clip_grad_hashes_synced = true`，`state_hashes_synced = true`，说明 DDP rank 间同步状态一致。
      - diagnostic failure 集中在 forward/sample tensors：`pairformer_output.z_trunk`、`diffusion_transformer.output_a`、`atom_attention_decoder.x_update/diffusion_module.x_update` 和最终 `pred_coordinate`。已观察到的 `pred_coordinate max_abs` 最大约 `9.5367431640625e-05`。
 
+6. r7 no-TF32 16GPU DDP replay 提交合同：
+   - H200 job：
+     `zjow-odesign-replay16g-notf32-0606-r7`
+   - 提交时间：
+     `2026-06-06 17:04 +0800` 左右。
+   - 提交入口：
+     H200 MCP `submit_experiment`，namespace `ailab-ai4sdata`，charged group `ai4sdata_gpu`。
+   - 规模：
+     `replicas=2`，每个 replica `gpu=8`、`cpu=160`、`memory=1600512Mi`，等价于正式 `2 node x 8 GPU` world size。
+   - runtime gate：
+     live 0GPU preflight `zjow-odesign-replay16g-pref-0606-r1` 已 `Succeeded`，用于验证容器内可见共享盘、runner、replay Python、数据根、ckpt 根、`35999.pt` checkpoint 和 `odesign` conda 环境。
+   - dry-run gate：
+     H200 MCP dry-run manifest 已确认 `mount=gpfs://gpfs1/ai4sreason:/mnt/shared-storage-user/ai4sreason`、`DISTRIBUTED_JOB=true`、`gang-start=true`、`enable-sshd=yes`、`hostNetwork=true`、priority `5`、`restartPolicy=Never` 均按预期渲染。
+   - 关键环境控制：
+     `MODEL_DTYPE=fp32`，
+     `USE_DEEPSPEED_EVO_ATTENTION=false`，
+     `NVIDIA_TF32_OVERRIDE=0`，
+     `DISABLE_TF32=true`，
+     `DISABLE_PERMUTATION=true`，
+     `DETERMINISTIC_MSA_ROWS=1`，
+     `DENSE_LDDT_MAX_ATOMS=0`，
+     `SAVE_GRAD_TENSORS=false`。
+   - replay 参数：
+     `UPDATES=3`，
+     `TRACE_SEED=20260605`，
+     主阈值 `ATOL=5e-4/RTOL=5e-4`，
+     diagnostic 阈值 `DIAGNOSTIC_ATOL=1e-4/DIAGNOSTIC_RTOL=1e-4`。
+   - 输出目录：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_16gpu_notf32_h200_0606_r7`
+   - 当前状态：
+     `Inqueue`，两个 replica 均为 `STARTING/Pending`；事件为 `pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable`。这表示 gang 调度尚未拿到两台 8GPU 节点，不是 user code 或 runner 启动失败。
+
+7. r8 no-TF32 8GPU 单节点 engineering replay 提交合同：
+   - H200 job：
+     `zjow-odesign-replay8g-notf32-0606-r1`
+   - 提交时间：
+     `2026-06-06 17:13 +0800` 左右。
+   - 提交入口：
+     H200 MCP `submit_experiment`，namespace `ailab-ai4sdata`，charged group `ai4sdata_gpu`。
+   - 规模：
+     `replicas=1`，单 replica `gpu=8`、`cpu=160`、`memory=1600512Mi`。
+   - 结论边界：
+     该任务使用 `SMOKE_MODE=1`，只验证单节点 8 rank DDP 和正式每节点 GPU 数；它不覆盖跨节点通信，也不能替代 r7 的正式 `2 node x 8 GPU` gate。
+   - dry-run gate：
+     H200 MCP dry-run manifest 已确认 `mount=gpfs://gpfs1/ai4sreason:/mnt/shared-storage-user/ai4sreason`、`DISTRIBUTED_JOB=true`、`enable-sshd=yes`、`hostNetwork=false`、priority `5`、`restartPolicy=Never` 均按预期渲染。
+   - 关键环境控制：
+     `MODEL_DTYPE=fp32`，
+     `USE_DEEPSPEED_EVO_ATTENTION=false`，
+     `NVIDIA_TF32_OVERRIDE=0`，
+     `DISABLE_TF32=true`，
+     `DISABLE_PERMUTATION=true`，
+     `DETERMINISTIC_MSA_ROWS=1`，
+     `DENSE_LDDT_MAX_ATOMS=0`，
+     `SAVE_GRAD_TENSORS=false`。
+   - replay 参数：
+     `UPDATES=3`，
+     `TRACE_SEED=20260605`，
+     主阈值 `ATOL=5e-4/RTOL=5e-4`，
+     diagnostic 阈值 `DIAGNOSTIC_ATOL=1e-4/DIAGNOSTIC_RTOL=1e-4`。
+   - 输出目录：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_8gpu_notf32_h200_0606_r1`
+   - 当前状态：
+     `Inqueue`，单 replica 为 `STARTING/Pending`；事件为 `pod group is not ready, 1 Pending, 1 minAvailable; Pending: 1 Unschedulable`。这表示当前没有可调度的单节点 8GPU 资源，不是 user code 或 runner 启动失败。
+
 当前判断：
 
 - r3 已排除“输入 feature/label、diffusion noise、MSA rows、padding mask 错位”作为首个发散原因。
@@ -649,7 +713,8 @@ bsz1 path:
 - r4 的最终状态仍是 `status=fail`，不能宣称 strict replay 已完全通过；但失败口径已经从默认 TF32 下的 `1e-4` 级首个发散，收敛为 no-TF32/fp32 下的 `1e-6 ~ 1e-5` 级尾差。
 - r5 已保存并比较完整 pre-clip/post-clip grad tensor，但仍只覆盖 1GPU、1 update、permutation disabled、deterministic MSA rows 的诊断配置。
 - r6 已覆盖单节点 4GPU DDP，但未保存完整 per-rank grad tensors；当前只能说 DDP 同步 hash、record、state 在主阈值下通过，不能说 strict forward diagnostics 通过。
-- 16GPU DDP replay 仍未完成；当前没有覆盖正式 world size 和跨节点通信。
+- r7 16GPU DDP replay 已提交并通过 dry-run/runtime preflight，但截至 `2026-06-06 17:16 +0800` 仍在排队；当前尚未覆盖正式 world size 和跨节点通信的实际执行结果。
+- r8 8GPU 单节点 engineering replay 已提交并通过 dry-run，但截至 `2026-06-06 17:16 +0800` 仍在排队；它即使完成，也只能作为单节点 8 rank 工程信号，不能替代 r7。
 
 ## 阶段二推荐实验矩阵
 
