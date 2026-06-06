@@ -614,11 +614,33 @@ bsz1 path:
      - `post_clip_grad_compare.allclose = true`，同一最坏 tensor 的 `max_abs = 2.2284220904111862e-06`。
      - `state_compare.allclose = true`，最坏 tensor 为 `diffusion_module.linear_no_bias_s.weight`，`max_abs = 2.343812957406044e-05`。
 
+5. r6 no-TF32 4GPU DDP replay：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r6`
+   - 环境控制：
+     `world_size=4`，
+     `MODEL_DTYPE=fp32`，
+     `USE_DEEPSPEED_EVO_ATTENTION=false`，
+     `NVIDIA_TF32_OVERRIDE=0`，
+     `DISABLE_TF32=true`，
+     `DISABLE_PERMUTATION=true`，
+     `DETERMINISTIC_MSA_ROWS=1`。
+   - 阈值：
+     主 replay `atol=5e-4/rtol=5e-4`，
+     forward/sample diagnostic `diagnostic_atol=2e-5/diagnostic_rtol=2e-5`。
+   - 最终 `summary.json`：
+     - `status = fail`，失败来自 4 个 rank 的 diagnostic compare；`record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`。
+     - 4 个 rank 的 `record_compare.allclose = true`，包括 `effective_loss`、`metrics_scaled_sum`、`grad_summary` 和 lr。
+     - 4 个 rank 的 `state_compare.allclose = true`；rank0 最坏 state tensor 为 `module.diffusion_module.atom_attention_encoder.linear_no_bias_q.weight`，`max_abs = 1.3172626495361328e-05`。
+     - 4 个 rank 的 `pre_clip_grad_hashes_synced = true`，`post_clip_grad_hashes_synced = true`，`state_hashes_synced = true`，说明 DDP rank 间同步状态一致。
+     - diagnostic failure 集中在 forward/sample tensors：`pairformer_output.z_trunk`、`diffusion_transformer.output_a`、`atom_attention_decoder.x_update/diffusion_module.x_update` 和最终 `pred_coordinate`。已观察到的 `pred_coordinate max_abs` 最大约 `9.5367431640625e-05`。
+
 当前判断：
 
 - r3 已排除“输入 feature/label、diffusion noise、MSA rows、padding mask 错位”作为首个发散原因。
 - r4 说明默认 replay 失败中的大差异主要来自 TF32/batch-shape 触发的不同 kernel 或累加路径。
 - r5 说明在 no-TF32/fp32 下，完整 pre-clip grad 的剩余最坏差异约为 `1.4e-5`，post-clip grad、state、record、sample tensor 和 forward probe 在当前口径下通过。
+- r6 说明 4GPU DDP 下每 rank 的 record/state/grad summary 和 DDP 同步 hash 在主阈值下通过；但 strict forward/sample diagnostic 仍会看到 `1e-4` 量级以内的 shape-sensitive fp32 差异。
 - 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议以 `2e-5` 作为真实大模型 CUDA fp32 full-grad 路径的强阈值，`5e-4` 作为训练集成层面的主阈值。
 - 对正式训练，TF32 可以作为性能路径保留，但不能期望 `bsz2` 与 `bsz1` 在 `1e-6` 级别严格 replay 等价。正式训练应更多依赖 loss/grad/state 的合理容差和后续 PBP/ODesignBench 指标，而不是 bitwise 或 near-bitwise 等价。
 
@@ -626,7 +648,8 @@ bsz1 path:
 
 - r4 的最终状态仍是 `status=fail`，不能宣称 strict replay 已完全通过；但失败口径已经从默认 TF32 下的 `1e-4` 级首个发散，收敛为 no-TF32/fp32 下的 `1e-6 ~ 1e-5` 级尾差。
 - r5 已保存并比较完整 pre-clip/post-clip grad tensor，但仍只覆盖 1GPU、1 update、permutation disabled、deterministic MSA rows 的诊断配置。
-- 4GPU/16GPU DDP replay 仍未完成；当前结论只说明 1GPU 真实样本诊断下首个大差异可由 TF32 数值路径解释。
+- r6 已覆盖单节点 4GPU DDP，但未保存完整 per-rank grad tensors；当前只能说 DDP 同步 hash、record、state 在主阈值下通过，不能说 strict forward diagnostics 通过。
+- 16GPU DDP replay 仍未完成；当前没有覆盖正式 world size 和跨节点通信。
 
 ## 阶段二推荐实验矩阵
 
