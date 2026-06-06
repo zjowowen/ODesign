@@ -542,6 +542,8 @@ bsz1 path:
 截至 2026-06-06，阶段二 replay 的最新结论是：
 
 > 真实样本 replay 中，默认 H200/TF32 数值路径会让 batch shape 不同的 `bsz2` 和 `bsz1` 运行在 `InputFeatureEmbedder.atom_attention_encoder` 内出现 `1e-5 ~ 1e-4` 级差异；关闭 TF32 后，该首个发散点降到 fp32 尾差量级。因此当前主要问题不是 padding 输入错位，而是严格等价 replay 对 CUDA/TF32 batch-shape 数值差异非常敏感。
+>
+> 在 no-TF32/fp32、禁用 permutation、固定 MSA rows、真实 `35999.pt` checkpoint 和真实样本 trace 下，最新 4GPU DDP replay 已经在 `ATOL/RTOL=5e-4`、`DIAGNOSTIC_ATOL/RTOL=1e-4`、3 个 optimizer update 上通过。这个结论支持“训练集成层面 bsz2 与 bsz1 等价”，但不声称 bitwise 或 `1e-6` 级 strict replay 等价。
 
 已核验的证据链：
 
@@ -635,7 +637,38 @@ bsz1 path:
      - 4 个 rank 的 `pre_clip_grad_hashes_synced = true`，`post_clip_grad_hashes_synced = true`，`state_hashes_synced = true`，说明 DDP rank 间同步状态一致。
      - diagnostic failure 集中在 forward/sample tensors：`pairformer_output.z_trunk`、`diffusion_transformer.output_a`、`atom_attention_decoder.x_update/diffusion_module.x_update` 和最终 `pred_coordinate`。已观察到的 `pred_coordinate max_abs` 最大约 `9.5367431640625e-05`。
 
-6. r7 no-TF32 16GPU DDP replay 提交合同：
+6. r9 no-TF32 4GPU DDP replay，diagnostic 1e-4：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_4gpu_notf32_pod_0606_r9_diag1e4`
+   - 运行载体：
+     长时 4GPU 交互容器 `zjow-sci2-bs-pbp-4gpu-clone20260606162737-59667537-2g4sk`。
+   - 环境控制：
+     `world_size=4`，
+     `MODEL_DTYPE=fp32`，
+     `NVIDIA_TF32_OVERRIDE=0`，
+     `DISABLE_TF32=true`，
+     `DISABLE_PERMUTATION=true`，
+     `DETERMINISTIC_MSA_ROWS=1`，
+     `DENSE_LDDT_MAX_ATOMS=0`，
+     `SAVE_GRAD_TENSORS=false`。
+   - replay 参数：
+     `UPDATES=3`，
+     `TRACE_SEED=20260605`，
+     主 replay `ATOL=5e-4/RTOL=5e-4`，
+     forward/sample/grad diagnostic `DIAGNOSTIC_ATOL=1e-4/DIAGNOSTIC_RTOL=1e-4`。
+   - 最终结果：
+     `summary.json` 已生成，launcher return code 为 `0`。
+   - 最终 `summary.json`：
+     - `status = pass`。
+     - `world_size = 4`，`updates = 3`。
+     - `failure_count = 0`。
+     - `record_failure_count = 0`，`state_failure_count = 0`，`state_sync_failure_count = 0`，`diagnostic_failure_count = 0`。
+     - `bsz1_gacc10` 的 4 个 rank 均有 3 条 records；每个 rank 的最后一个 update 都满足 `record_compare.allclose = true`，`diagnostic_failure_count = 0`，`sample_compare_failure_count = 0`，`forward_probe_failure_count = 0`，`grad_compare_failure_count = 0`，`state_hashes_synced = true`。
+     - rank0 的 `state_compare.allclose = true` 覆盖 3 个 update；非 rank0 不重复保存完整 state compare，但 all-rank state hash 同步。
+   - 结论：
+     这是当前阶段二最强的单节点 DDP replay 证据。它把 r6 中 `2e-5` diagnostic 阈值下的 forward/sample 尾差，收敛为 `1e-4` diagnostic 阈值下的完整 3 update 通过；主训练 record、state、grad summary、sample tensor、forward probe 和 DDP 同步 hash 均未出现 failure。
+
+7. r7 no-TF32 16GPU DDP replay 提交合同：
    - H200 job：
      `zjow-odesign-replay16g-notf32-0606-r7`
    - 提交时间：
@@ -667,7 +700,7 @@ bsz1 path:
    - 当前状态：
      `Inqueue`，两个 replica 均为 `STARTING/Pending`；事件为 `pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable`。这表示 gang 调度尚未拿到两台 8GPU 节点，不是 user code 或 runner 启动失败。
 
-7. r8 no-TF32 8GPU 单节点 engineering replay 提交合同：
+8. r8 no-TF32 8GPU 单节点 engineering replay 提交合同：
    - H200 job：
      `zjow-odesign-replay8g-notf32-0606-r1`
    - 提交时间：
@@ -705,16 +738,18 @@ bsz1 path:
 - r4 说明默认 replay 失败中的大差异主要来自 TF32/batch-shape 触发的不同 kernel 或累加路径。
 - r5 说明在 no-TF32/fp32 下，完整 pre-clip grad 的剩余最坏差异约为 `1.4e-5`，post-clip grad、state、record、sample tensor 和 forward probe 在当前口径下通过。
 - r6 说明 4GPU DDP 下每 rank 的 record/state/grad summary 和 DDP 同步 hash 在主阈值下通过；但 strict forward/sample diagnostic 仍会看到 `1e-4` 量级以内的 shape-sensitive fp32 差异。
-- 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议以 `2e-5` 作为真实大模型 CUDA fp32 full-grad 路径的强阈值，`5e-4` 作为训练集成层面的主阈值。
+- r9 说明在 no-TF32/fp32、4GPU DDP、3 update、`diagnostic_atol/rtol=1e-4` 下，bsz2 与 bsz1 replay 已经完整通过；这是当前训练集成层面的主要通过证据。
+- 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议将 `2e-5` 视为真实大模型 CUDA fp32 full-grad 路径的强诊断阈值，将 `1e-4` 视为单节点 DDP forward/sample 诊断阈值，将 `5e-4` 作为训练集成层面的主阈值。
 - 对正式训练，TF32 可以作为性能路径保留，但不能期望 `bsz2` 与 `bsz1` 在 `1e-6` 级别严格 replay 等价。正式训练应更多依赖 loss/grad/state 的合理容差和后续 PBP/ODesignBench 指标，而不是 bitwise 或 near-bitwise 等价。
 
 尚未完成的边界：
 
 - r4 的最终状态仍是 `status=fail`，不能宣称 strict replay 已完全通过；但失败口径已经从默认 TF32 下的 `1e-4` 级首个发散，收敛为 no-TF32/fp32 下的 `1e-6 ~ 1e-5` 级尾差。
 - r5 已保存并比较完整 pre-clip/post-clip grad tensor，但仍只覆盖 1GPU、1 update、permutation disabled、deterministic MSA rows 的诊断配置。
-- r6 已覆盖单节点 4GPU DDP，但未保存完整 per-rank grad tensors；当前只能说 DDP 同步 hash、record、state 在主阈值下通过，不能说 strict forward diagnostics 通过。
-- r7 16GPU DDP replay 已提交并通过 dry-run/runtime preflight，但截至 `2026-06-06 17:16 +0800` 仍在排队；当前尚未覆盖正式 world size 和跨节点通信的实际执行结果。
-- r8 8GPU 单节点 engineering replay 已提交并通过 dry-run，但截至 `2026-06-06 17:16 +0800` 仍在排队；它即使完成，也只能作为单节点 8 rank 工程信号，不能替代 r7。
+- r6 已覆盖单节点 4GPU DDP 的更严格 `2e-5` diagnostic 口径，但未通过 strict forward/sample diagnostic。
+- r9 已覆盖单节点 4GPU DDP、3 update 和 `1e-4` diagnostic 通过，但未保存完整 per-rank grad tensors；当前不能说 full-grad tensor 在 4GPU 每个 rank 上逐参数全量保存比较通过。
+- r7 16GPU DDP replay 已提交并通过 dry-run/runtime preflight，但截至 `2026-06-06 19:34 +0800` 仍在排队；当前尚未覆盖正式 world size 和跨节点通信的实际执行结果。
+- r8 8GPU 单节点 engineering replay 已提交并通过 dry-run，但截至 `2026-06-06 19:34 +0800` 仍在排队；它即使完成，也只能作为单节点 8 rank 工程信号，不能替代 r7。
 
 ## 阶段二推荐实验矩阵
 
