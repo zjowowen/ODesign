@@ -537,6 +537,70 @@ bsz1 path:
 4. 再证明 loss 中间态一致，当前最敏感项是 smooth LDDT；如果 `pred_coordinate` 一致但 LDDT loss 不一致，优先查 `lddt_mask`、sparse pair index、reduction denominator 和 chunk/recompute。
 5. 最后比较 pre-clip grad、post-clip grad、optimizer state。梯度之前的任一层不一致，都不要用参数 allclose 判定等价。
 
+## 阶段二：当前 Replay 诊断证据
+
+截至 2026-06-06，阶段二 replay 的最新结论是：
+
+> 真实样本 replay 中，默认 H200/TF32 数值路径会让 batch shape 不同的 `bsz2` 和 `bsz1` 运行在 `InputFeatureEmbedder.atom_attention_encoder` 内出现 `1e-5 ~ 1e-4` 级差异；关闭 TF32 后，该首个发散点降到 fp32 尾差量级。因此当前主要问题不是 padding 输入错位，而是严格等价 replay 对 CUDA/TF32 batch-shape 数值差异非常敏感。
+
+已核验的证据链：
+
+1. r2 forward hook：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_forward_hook35999_fix2_0606_r2`
+   - 结果：replay 按预期失败。
+   - `bsz1 loss = 9.140436112880707`，`bsz2 loss = 9.080204248428345`，差异约 `0.06023186445236206`。
+   - 当时的全局首个共同 mismatch 出现在 `pairformer_output.s_inputs`。
+
+2. r3 input embedder probe：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_forward_hook35999_inputembed_0606_r3`
+   - 已确认一致的输入：
+     `diffusion_input.x_noisy/ref_pos/ref_mask/atom_to_token_idx/is_condition_atom`，
+     以及 `InputFeatureEmbedder` 原始输入 `restype/profile/deletion_mean/is_hotspot_residue/ref_pos/ref_mask/ref_element/ref_charge/ref_atom_name_chars/ref_space_uid/atom_to_token_idx/padding_mask`。
+   - `input_atom_attention_encoder.c_skip` 一致。
+   - 首个差异出现在无坐标 `AtomAttentionEncoder` 输出：
+     `input_atom_attention_encoder.q_skip` 最大 sample 差异约 `6.3329935e-05`，
+     `input_atom_attention_encoder.a_token` 最大 sample 差异约 `1.258254e-04`。
+
+3. r4 no-TF32 probe：
+   - run dir：
+     `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/replay_bsz2_bsz1_forward_hook35999_inputembed_notf32_pod_0606_r4`
+   - 环境控制：
+     `MODEL_DTYPE=fp32`，
+     `USE_DEEPSPEED_EVO_ATTENTION=false`，
+     `NVIDIA_TF32_OVERRIDE=0`，
+     `DISABLE_TF32=true`，
+     `DISABLE_PERMUTATION=true`，
+     `DETERMINISTIC_MSA_ROWS=1`。
+   - `bsz1_gacc10` 与 `bsz2_gacc5` 的 `update000_pos00` forward probe 已对齐：`sample_idx=0`，`real_atom_len=2027`，`real_token_len=430`，281 个 probe record 全部按 `(base_name, occurrence)` 对齐。
+   - 关键差异：
+     - `input_atom_attention_encoder.q_skip`: `max_abs = 2.384185791015625e-07`，没有超过 `1e-6` 的坏点。
+     - `input_atom_attention_encoder.a_token`: `max_abs = 2.384185791015625e-07`，没有超过 `1e-6` 的坏点。
+     - `input_embedder.s_inputs`: `max_abs = 2.384185791015625e-07`，没有超过 `1e-6` 的坏点。
+     - `pairformer_output.z_trunk`: `max_abs = 1.6093254089355469e-06`，存在少量 `1e-6` 级尾差，但没有超过 `1e-5` 或 `5e-4` 的坏点。
+     - `atom_attention_decoder.x_update`: 最大约 `2.3e-06`，没有超过 `1e-5` 或 `5e-4` 的坏点。
+   - 最终 `summary.json`：
+     - `status = fail`，但失败来自 `diagnostic_atol=1e-6/diagnostic_rtol=1e-6` 的细粒度诊断阈值。
+     - 主 replay 阈值 `atol=5e-4/rtol=5e-4` 下，`record_compare.allclose = true`，`state_compare.allclose = true`，`state_failure_count = 0`，`record_failure_count = 0`。
+     - `effective_loss` 差异约 `5.364418029785156e-07`。
+     - `grad_summary` 在主阈值下 allclose，最坏 summary 差异为 `grad_abs_sum` 约 `5.735119339078665e-04`，相对差异约 `2.592178175664554e-08`。
+     - `state_compare` 在主阈值下 allclose，最坏 tensor 为 `diffusion_module.linear_no_bias_s.weight`，`max_abs = 1.819126191549003e-05`。
+     - sample tensor compare 的剩余失败都集中在 `pred_coordinate` 的 `1e-6` 级诊断阈值上；已打印样本中的最大 `pred_coordinate max_abs` 为 `7.62939453125e-06`，`mean_abs` 约 `3e-7 ~ 4e-7`。
+
+当前判断：
+
+- r3 已排除“输入 feature/label、diffusion noise、MSA rows、padding mask 错位”作为首个发散原因。
+- r4 说明默认 replay 失败中的大差异主要来自 TF32/batch-shape 触发的不同 kernel 或累加路径。
+- 对严格等价 replay，应使用 fp32 诊断配置并关闭 TF32；诊断容差建议以 `1e-5` 作为真实大模型 CUDA fp32 路径的强阈值，`5e-4` 作为训练集成层面的主阈值。
+- 对正式训练，TF32 可以作为性能路径保留，但不能期望 `bsz2` 与 `bsz1` 在 `1e-6` 级别严格 replay 等价。正式训练应更多依赖 loss/grad/state 的合理容差和后续 PBP/ODesignBench 指标，而不是 bitwise 或 near-bitwise 等价。
+
+尚未完成的边界：
+
+- r4 的最终状态仍是 `status=fail`，不能宣称 strict replay 已完全通过；但失败口径已经从默认 TF32 下的 `1e-4` 级首个发散，收敛为 no-TF32/fp32 下的 `1e-6 ~ 1e-5` 级尾差。
+- r4 没有保存完整 pre-clip/post-clip grad tensor，只比较了 grad summary 和 state；若要做最终阶段二 gate，还需要打开完整 grad tensor 或保存 top-k mismatch tensor。
+- 4GPU/16GPU DDP replay 仍未完成；当前结论只说明 1GPU 真实样本诊断下首个大差异可由 TF32 数值路径解释。
+
 ## 阶段二推荐实验矩阵
 
 | 实验 | 目的 | 规模 | 随机控制 | 通过标准 |
@@ -599,5 +663,6 @@ bsz1 path:
 阶段二：
 
 - 已有 replay 结果显示只看参数更新不足够。曾出现 `state_compare allclose=True` 但 `loss` 和 `grad_summary` 不 allclose。
-- 已有 replay 指向 `weighted_smooth_lddt_loss` 是主要差异项，`mse_loss/bond_loss/distogram_loss` 差异相对小。
-- 当前正在推进更细粒度 replay，目标是比较 per-sample `noise_level/pred_coordinate/lddt_mask/smooth_lddt_sparse/pre_clip_grad/post_clip_grad`，用于判断差异到底来自 diffusion noise、forward、LDDT loss/reduction 还是 backward/grad。
+- 早期 replay 曾指向 `weighted_smooth_lddt_loss` 是主要差异项，但后续 forward hook 进一步显示，loss 差异之前已经存在 `pred_coordinate`/trunk 表征差异。
+- r3/r4 诊断把首个大差异定位到默认 H200/TF32 数值路径下的 `InputFeatureEmbedder.atom_attention_encoder` 输出；关闭 TF32 后该差异降至 fp32 尾差量级。
+- 接下来阶段二应使用 no-TF32/fp32 诊断配置完成完整 replay summary，再扩展到 4GPU/16GPU DDP replay。正式训练可以使用性能配置，但 strict replay 不能用 TF32 路径判定 padding 逻辑是否等价。
