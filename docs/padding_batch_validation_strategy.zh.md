@@ -1018,14 +1018,14 @@ bsz1 path:
 
 ### 最新 live 状态记录
 
-截至 `2026-06-07 21:28:48 +0800` 的 H200 MCP `get_job` 查询：
+截至 `2026-06-07 23:08:19 +0800` 的 H200 MCP `get_job` 查询：
 
 | H200 job | 外层状态 | replica 状态 | 当前判断 |
 | --- | --- | --- | --- |
 | `zjow-odesign-formal-bsz2-from0-0607-r1` | `Inqueue` | `STARTING`, `STARTING` | 已提交并进入调度/启动流程；尚未证明训练进程已开始 |
 | `zjow-odesign-formal-bsz2-resume35999-0607-r1` | `Inqueue` | `STARTING`, `STARTING` | 已提交并进入调度/启动流程；尚未证明训练进程已开始 |
 
-这个状态不能解释为失败，也不能解释为训练已经运行。下一次状态转移如果出现：
+这个状态与 `2026-06-07 21:28:48 +0800`、`2026-06-07 22:01:28 +0800` 和 `2026-06-07 22:36:33 +0800` 的前几轮查询一致，属于长时间调度/启动等待；不能解释为失败，也不能解释为训练已经运行。下一次状态转移如果出现：
 
 - `Running`：优先读取共享盘 record dir，确认 `env_node*.txt`、`stdout_stderr_node*.log`、`gpu_memory_node*.csv` 是否写出。
 - `Failed`：先保留 H200 job 和共享盘 record，再检查 `returncode_node*.txt`、rank0 stderr、NCCL/OOM/checkpoint load 相关错误。
@@ -1036,7 +1036,7 @@ bsz1 path:
 - 本地分支：`feature/odesign-padding-batch`
 - 本地文档状态：已提交到当前分支的最新本地 commit
 - 远端 fork：`https://github.com/zjowowen/ODesign.git`
-- 截至本状态记录，GitHub HTTPS 连接失败，错误包括 `Empty reply from server` 和 `Failed to connect to github.com port 443`；因此该文档提交仍可能只存在于本地工作树，需网络恢复后重新 `git push fork feature/odesign-padding-batch`。
+- 阶段三训练合同文档已同步到 fork 的 `feature/odesign-padding-batch` 分支；`2026-06-07 23:08:19 +0800` live 状态更新因 GitHub HTTPS 间歇性连接失败仍需网络恢复后补推。
 
 ## 当前项目状态摘要
 
@@ -1072,6 +1072,6 @@ bsz1 path:
 阶段三：
 
 - 已提交 `zjow-odesign-formal-bsz2-from0-0607-r1` 和 `zjow-odesign-formal-bsz2-resume35999-0607-r1` 两个正式 16GPU 训练任务。
-- `2026-06-07 21:28:48 +0800` 查询显示两个任务仍为外层 `Inqueue`，两个 replica 均为 `STARTING`；当前状态只表示任务已提交到 H200 并进入调度/启动流程，尚未完成“训练已实际启动、日志正常、checkpoint 正常写出、PBP/ODesignBench 质量通过”的证据闭环。
+- `2026-06-07 23:08:19 +0800` 查询显示两个任务仍为外层 `Inqueue`，两个 replica 均为 `STARTING`；当前状态只表示任务已提交到 H200 并处于长时间调度/启动等待，尚未完成“训练已实际启动、日志正常、checkpoint 正常写出、PBP/ODesignBench 质量通过”的证据闭环。
 - 下一步监控 gate 是确认两个任务写出 `env_node*.txt`、训练 stdout/stderr、GPU memory 记录和 rank0 checkpoint 列表；如 H200 日志不可用，则继续用共享盘 artifact 或 0GPU 只读断言探针取证。
-- 文档改动已在本地提交，但 GitHub HTTPS 当前不可达，远端 fork 同步需要网络恢复后补推。
+- 阶段三训练合同文档已同步到 fork；`23:08` live 状态更新在本地最新提交中，远端同步受 GitHub HTTPS 间歇性连接失败阻塞。
