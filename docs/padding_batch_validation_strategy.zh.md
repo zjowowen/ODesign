@@ -84,11 +84,18 @@
 
 目的：在阶段一和阶段二通过后，再启动完整训练，评估真实收敛、checkpoint 质量和 PBP/ODesignBench 指标。
 
-本文档暂不展开第三阶段，只保留验收原则：
+截至 2026-06-07，阶段三已经从“待定方案”推进到正式训练提交阶段。当前采用的进入条件是：
+
+- 阶段一单元测试已通过，覆盖 padded collate、模型接口、mask、loss、gradient 和 multi-step optimizer 等价。
+- 阶段二 replay 已覆盖 4GPU `1e-4` diagnostic 通过、8GPU 单节点 `1e-4` artifact 通过，以及 16GPU 正式 world size 在 `2e-4` diagnostic 口径下通过。
+- 16GPU `1e-4` strict replay 仍不是 pass，这个边界不能被正式训练提交反向覆盖。
+
+阶段三验收原则：
 
 - 使用明确的 training contract 和 evaluation contract。
 - 同步记录代码 commit、配置、数据路径、checkpoint 路径、评测脚本、评测结果。
 - 正式训练不能用 smoke/replay 结果替代。
+- 正式训练成功必须至少有训练日志、return code、checkpoint 文件、配置快照和后续 PBP/ODesignBench 评测结果；只看到 H200 job `Succeeded` 或只看到 checkpoint 生成都不等价于质量通过。
 
 ## 阶段一：模型数据流和 Shape 改造清单
 
@@ -934,16 +941,102 @@ bsz1 path:
 
 如果 `state_after_update allclose` 但 `loss/grad` 不 allclose，结论必须是“参数更新被 LR/optimizer/clip/容差掩盖”，不能判定训练等价。
 
-## 阶段三：整体训练占位
+## 阶段三：整体训练合同和监控
 
-阶段三应在阶段二通过后启动，建议拆成：
+阶段三拆成四类工作：
 
 1. 正式 4GPU 短训 smoke：快速发现 runtime、保存 checkpoint、eval 脚本问题。
 2. 正式 16GPU 从 0 开始训练：验证新 batchwise 训练完整链路。
 3. 正式 16GPU resume 长训：验证从已有 checkpoint 继续训练的指标连续性。
 4. checkpoint PBP/ODesignBench 测评：比较历史 best setting、bsz1 对照和 bsz2 新训练。
 
-阶段三文档需要另行补充 training contract、evaluation contract、stop criteria、checkpoint 选择和评测报告模板。
+### 已提交的正式训练任务
+
+2026-06-07 已通过 H200 MCP 提交两个正式 16GPU 任务。两个任务共用同一 batch 合同：
+
+| 项目 | 设置 |
+| --- | --- |
+| H200 job topology | `replicas=2`，每个 replica `gpu=8`，总 world size `16` |
+| CPU/内存 | 每 replica `cpu=160`、`memory_gb=1563` |
+| 网络/调度 | `host_network=true`，`gang_start=true`，`enable_sshd=true`，`priority=5` |
+| runtime root | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign` |
+| data root | `/mnt/shared-storage-user/ai4sreason/scireason_2/data/odesign` |
+| exp config | `train_odesign_base_prot_flex_weighted_before20210930_reso_below4_16gpu_tokenbalanced` |
+| train batch | `exp.data.train_batch_size=2` per GPU/rank |
+| grad accumulation | `exp.iters_to_accumulate=5` |
+| effective samples/update | `2 * 16 * 5 = 160`，对齐旧设置 `1 * 16 * 10 = 160` |
+| diffusion batch | `exp.diffusion_batch_size=48` |
+| lDDT chunk | `exp.loss.diffusion_lddt_chunk_size=1` |
+| train crop | `exp.train_crop_size=640`，`exp.data.train_crop_size=640` |
+| epoch size | `exp.data.epoch_size=1286480` |
+| dataloader workers | `exp.data.num_dl_workers=4` |
+| max/checkpoint | `exp.max_steps=100000`，`exp.checkpoint_interval=400` |
+| production kernel path | `exp.model.use_deepspeed_evo_attention=true`，`NVIDIA_TF32_OVERRIDE=1` |
+
+任务一：从 base weights 开始训练。
+
+- H200 job：`zjow-odesign-formal-bsz2-from0-0607-r1`
+- run id：`formal_bsz2_gacc5_from0_0607_r1`
+- exp name：`train_odesign_base_prot_flex_weighted_before20210930_reso_below4_16gpu_tokenbalanced_bsz2_gacc5_from0`
+- load checkpoint：`/mnt/shared-storage-user/ai4sreason/scireason_2/data/odesign/ckpt/protenix_base_default_v0.5.0.pt`
+- checkpoint 加载语义：`exp.load_params_only=true`，`exp.skip_load_optimizer=true`，`exp.skip_load_step=true`，`exp.skip_load_scheduler=true`，`exp.load_step_for_scheduler=false`
+- record dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/formal_bsz2_gacc5_from0_0607_r1`
+- output dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/outputs/train_odesign_base_prot_flex_weighted_before20210930_reso_below4_16gpu_tokenbalanced_bsz2_gacc5_from0/formal_bsz2_gacc5_from0_0607_r1`
+
+任务二：从历史 `35999.pt` resume 长训。
+
+- H200 job：`zjow-odesign-formal-bsz2-resume35999-0607-r1`
+- run id：`formal_bsz2_gacc5_resume35999_0607_r1`
+- exp name：`train_odesign_base_prot_flex_weighted_before20210930_reso_below4_16gpu_tokenbalanced_bsz2_gacc5_resume35999`
+- load checkpoint：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_3/SciReasoner-2/reference/ODesign/outputs/train_odesign_base_prot_flex_weighted_before20210930_reso_below4_16gpu_tokenbalanced/2026-04-26_14-44-00/checkpoints/35999.pt`
+- checkpoint 加载语义：`exp.load_params_only=false`，`exp.skip_load_optimizer=false`，`exp.skip_load_step=false`，`exp.skip_load_scheduler=false`，`exp.load_step_for_scheduler=true`
+- record dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/formal_bsz2_gacc5_resume35999_0607_r1`
+- output dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/outputs/train_odesign_base_prot_flex_weighted_before20210930_reso_below4_16gpu_tokenbalanced_bsz2_gacc5_resume35999/formal_bsz2_gacc5_resume35999_0607_r1`
+
+### 正式训练监控口径
+
+启动阶段必须先确认：
+
+- H200 job 从 `Inqueue/STARTING` 进入实际 running，而不是提交后立刻失败。
+- 每个 node 写出 `env_node*.txt`，其中包含最终 `torchrun` 命令、代码文件 sha256、checkpoint 加载语义和 batch/diffusion 参数。
+- 每个 node 写出 `stdout_stderr_node*.log`，且 rank0 日志能看到 checkpoint 加载、dataloader 初始化和训练 step。
+- `returncode_node*.txt` 不应在启动早期写出非零值。
+
+运行阶段持续监控：
+
+- `gpu_memory_node*.csv` 和 `gpu_memory_peaks.txt` 是否持续更新，判断是否真正使用 GPU 以及显存是否接近上限。
+- `output_files.txt`、`checkpoints.txt` 和输出目录中的 `checkpoints/*.pt`，判断 checkpoint 是否按 `checkpoint_interval=400` 产生。
+- rank0 训练日志中的 loss 是否为有限值，是否出现 dataloader bad sample、OOM、NCCL timeout、checkpoint load mismatch 或 DeepSpeed Evo attention 编译/运行错误。
+- H200 的 `get_job_logs` 曾出现空日志，因此正式证据以共享盘 artifact 和必要时的 0GPU 只读断言探针为准。
+
+阶段三当前 claim boundary：
+
+- 已提交正式训练任务不等价于训练已经启动。
+- 训练写出 checkpoint 不等价于 checkpoint 质量通过。
+- production path 使用 TF32 和 DeepSpeed Evo attention；它用于正式训练效率，不用于 strict replay 证明。
+- 后续质量结论必须来自 PBP/ODesignBench 评测，并与历史 best setting 或 bsz1 对照比较。
+
+### 最新 live 状态记录
+
+截至 `2026-06-07 21:28:48 +0800` 的 H200 MCP `get_job` 查询：
+
+| H200 job | 外层状态 | replica 状态 | 当前判断 |
+| --- | --- | --- | --- |
+| `zjow-odesign-formal-bsz2-from0-0607-r1` | `Inqueue` | `STARTING`, `STARTING` | 已提交并进入调度/启动流程；尚未证明训练进程已开始 |
+| `zjow-odesign-formal-bsz2-resume35999-0607-r1` | `Inqueue` | `STARTING`, `STARTING` | 已提交并进入调度/启动流程；尚未证明训练进程已开始 |
+
+这个状态不能解释为失败，也不能解释为训练已经运行。下一次状态转移如果出现：
+
+- `Running`：优先读取共享盘 record dir，确认 `env_node*.txt`、`stdout_stderr_node*.log`、`gpu_memory_node*.csv` 是否写出。
+- `Failed`：先保留 H200 job 和共享盘 record，再检查 `returncode_node*.txt`、rank0 stderr、NCCL/OOM/checkpoint load 相关错误。
+- 长时间保持 `Inqueue/STARTING`：按调度等待处理，不应重复提交同名或等价正式任务，除非明确决定取消或重提。
+
+文档同步状态：
+
+- 本地分支：`feature/odesign-padding-batch`
+- 本地文档状态：已提交到当前分支的最新本地 commit
+- 远端 fork：`https://github.com/zjowowen/ODesign.git`
+- 截至本状态记录，GitHub HTTPS 连接失败，错误包括 `Empty reply from server` 和 `Failed to connect to github.com port 443`；因此该文档提交仍可能只存在于本地工作树，需网络恢复后重新 `git push fork feature/odesign-padding-batch`。
 
 ## 当前项目状态摘要
 
@@ -975,3 +1068,10 @@ bsz1 path:
 - 早期 replay 曾指向 `weighted_smooth_lddt_loss` 是主要差异项，但后续 forward hook 进一步显示，loss 差异之前已经存在 `pred_coordinate`/trunk 表征差异。
 - r3/r4 诊断把首个大差异定位到默认 H200/TF32 数值路径下的 `InputFeatureEmbedder.atom_attention_encoder` 输出；关闭 TF32 后该差异降至 fp32 尾差量级。
 - r9/r10 已在 no-TF32/fp32/no-evo 控制变量下完成 4GPU、3 update 主 replay；r11 补 full-grad tensor 1 update；r18 补 4GPU、`per_rank_samples=10`、1 update、`FORWARD_PROBE_SAMPLE_POS=0` forward-probe replay；r20 补 2GPU、`FORWARD_PROBE_SAMPLE_POS=9` repeat；r22 补 2GPU、`per_rank_samples=2`、1 update 的 full-grad + forward-probe 组合通过；r21 补 16GPU、3 update、`DIAGNOSTIC_ATOL/RTOL=2e-4` 通过。接下来阶段二的主要缺口是如果坚持 16GPU `1e-4` strict replay 口径仍未通过，以及如果需要更强证据时补更多 sample position 的 forward-probe sweep、3 update forward-probe 或 3 update full-grad tensor 组合。正式训练可以使用性能配置，但 strict replay 不能用 TF32 路径判定 padding 逻辑是否等价。
+
+阶段三：
+
+- 已提交 `zjow-odesign-formal-bsz2-from0-0607-r1` 和 `zjow-odesign-formal-bsz2-resume35999-0607-r1` 两个正式 16GPU 训练任务。
+- `2026-06-07 21:28:48 +0800` 查询显示两个任务仍为外层 `Inqueue`，两个 replica 均为 `STARTING`；当前状态只表示任务已提交到 H200 并进入调度/启动流程，尚未完成“训练已实际启动、日志正常、checkpoint 正常写出、PBP/ODesignBench 质量通过”的证据闭环。
+- 下一步监控 gate 是确认两个任务写出 `env_node*.txt`、训练 stdout/stderr、GPU memory 记录和 rank0 checkpoint 列表；如 H200 日志不可用，则继续用共享盘 artifact 或 0GPU 只读断言探针取证。
+- 文档改动已在本地提交，但 GitHub HTTPS 当前不可达，远端 fork 同步需要网络恢复后补推。
