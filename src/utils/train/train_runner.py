@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 import logging
+import json
+import time
 
 import wandb
 from ml_collections.config_dict import ConfigDict
@@ -67,7 +69,130 @@ class TrainRunner(object):
         # Add for grad accumulation, it can increase real batch size
         self.iters_to_accumulate = self.configs.iters_to_accumulate    
 
+        self.profile_jsonl = os.environ.get("ODESIGN_PROFILE_JSONL", "")
+        self.profile_all_ranks = os.environ.get("ODESIGN_PROFILE_ALL_RANKS", "0") == "1"
+        self.profile_enabled = bool(self.profile_jsonl) and (
+            self.profile_all_ranks or DIST_WRAPPER.rank == 0
+        )
+        self.profile_sync_cuda = os.environ.get("ODESIGN_PROFILE_SYNC_CUDA", "1") != "0"
+        self.profile_jsonl_path = None
+        self._profile_last_iter_end = time.perf_counter()
+        if self.profile_enabled:
+            base_path = Path(self.profile_jsonl)
+            if self.profile_all_ranks:
+                suffix = base_path.suffix or ".jsonl"
+                stem = base_path.stem if base_path.suffix else base_path.name
+                base_path = base_path.with_name(
+                    f"{stem}_rank{DIST_WRAPPER.rank:02d}{suffix}"
+                )
+            base_path.parent.mkdir(parents=True, exist_ok=True)
+            self.profile_jsonl_path = base_path
+
         self.load_checkpoint()
+
+    def _profile_now(self) -> float:
+        if (
+            self.profile_sync_cuda
+            and torch.cuda.is_available()
+            and self.device.type == "cuda"
+        ):
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    @staticmethod
+    def _profile_to_int(value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return 0
+            return int(value.detach().cpu().sum().item())
+        if isinstance(value, (list, tuple)):
+            total = 0
+            for item in value:
+                item_value = TrainRunner._profile_to_int(item)
+                if item_value is not None:
+                    total += item_value
+            return total
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _profile_to_float(value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return 0.0
+            return float(value.detach().float().mean().cpu().item())
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _profile_batch_stats(self, batch: dict) -> dict:
+        stats = {}
+        basic = batch.get("basic", {}) if isinstance(batch, dict) else {}
+        feature_data = batch.get("feature_data") if isinstance(batch, dict) else None
+
+        n_token = self._profile_to_int(basic.get("N_token")) if basic else None
+        n_atom = self._profile_to_int(basic.get("N_atom")) if basic else None
+        if n_token is not None:
+            stats["num_tokens_real"] = n_token
+        if n_atom is not None:
+            stats["num_atoms_real"] = n_atom
+
+        token_padding_mask = getattr(feature_data, "token_padding_mask", None)
+        if token_padding_mask is not None:
+            stats["num_tokens_padded"] = int(token_padding_mask.numel())
+            stats["num_tokens_real_from_mask"] = int(
+                (~token_padding_mask.bool()).sum().item()
+            )
+        atom_padding_mask = getattr(feature_data, "atom_padding_mask", None)
+        if atom_padding_mask is not None:
+            stats["num_atoms_padded"] = int(atom_padding_mask.numel())
+            stats["num_atoms_real_from_mask"] = int(
+                (~atom_padding_mask.bool()).sum().item()
+            )
+
+        if "num_tokens_real" in stats and "num_tokens_padded" in stats:
+            denom = max(stats["num_tokens_padded"], 1)
+            stats["token_padding_ratio"] = 1.0 - stats["num_tokens_real"] / denom
+        if "num_atoms_real" in stats and "num_atoms_padded" in stats:
+            denom = max(stats["num_atoms_padded"], 1)
+            stats["atom_padding_ratio"] = 1.0 - stats["num_atoms_real"] / denom
+
+        pdb_id = basic.get("pdb_id") if basic else None
+        if pdb_id is not None:
+            stats["pdb_id"] = pdb_id
+        return stats
+
+    def _profile_write(self, record: dict):
+        if not self.profile_enabled or self.profile_jsonl_path is None:
+            return
+        record = dict(record)
+        record["rank"] = DIST_WRAPPER.rank
+        record["world_size"] = DIST_WRAPPER.world_size
+        record["step"] = int(self.step)
+        record["global_step"] = int(self.global_step)
+        record["timestamp"] = time.time()
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            record["gpu_mem_allocated_mib"] = (
+                torch.cuda.memory_allocated(self.device) / 1024**2
+            )
+            record["gpu_mem_reserved_mib"] = (
+                torch.cuda.memory_reserved(self.device) / 1024**2
+            )
+            record["gpu_mem_max_allocated_mib"] = (
+                torch.cuda.max_memory_allocated(self.device) / 1024**2
+            )
+            record["gpu_mem_max_reserved_mib"] = (
+                torch.cuda.max_memory_reserved(self.device) / 1024**2
+            )
+        with self.profile_jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
 
     def load_checkpoint(self):
 
@@ -273,7 +398,7 @@ class TrainRunner(object):
                 self.model.parameters(), self.configs.grad_clip_norm
             )
 
-    def train_step(self, batch: dict):
+    def train_step(self, batch: dict, profile_record: dict | None = None):
         self.model.train()
         # FP16 training has not been verified yet
         train_precision = {
@@ -294,21 +419,38 @@ class TrainRunner(object):
             enabled=(self.configs.model.dtype == "float16"),
         )
 
+        train_step_start = self._profile_now() if profile_record is not None else None
         with enable_amp:
+            forward_start = self._profile_now() if profile_record is not None else None
             pred_output, ground_truth, loss_input = self.model_forward(batch, mode="train")
+            if profile_record is not None:
+                profile_record["forward_sec"] = self._profile_now() - forward_start
+            loss_start = self._profile_now() if profile_record is not None else None
             loss, loss_dict = self.get_loss(loss_input, pred_output, ground_truth, mode="train")
+            if profile_record is not None:
+                profile_record["loss_sec"] = self._profile_now() - loss_start
+                profile_record["loss"] = self._profile_to_float(loss)
+                profile_record["loss_components"] = {
+                    key: self._profile_to_float(value)
+                    for key, value in loss_dict.items()
+                    if "loss" in key
+                }
 
         if self.configs.model.dtype in ["bf16", "fp32"]:
             if is_loss_nan_check(loss):
                 self.print(f"Skip iteration with NaN loss: {self.step} steps")
                 loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
+        backward_start = self._profile_now() if profile_record is not None else None
         scaler.scale(loss / self.iters_to_accumulate).backward()
+        if profile_record is not None:
+            profile_record["backward_sec"] = self._profile_now() - backward_start
 
         # For simplicity, the global training step is used
         if (self.global_step + 1) % self.iters_to_accumulate == 0:
             self.print(
                 f"self.step {self.step}, self.iters_to_accumulate: {self.iters_to_accumulate}"
             )
+            optimizer_start = self._profile_now() if profile_record is not None else None
             # Unscales the gradients of optimizer's assigned parameters in-place
             scaler.unscale_(self.optimizer)
             # Do grad clip only
@@ -317,11 +459,21 @@ class TrainRunner(object):
             scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
+            if profile_record is not None:
+                profile_record["optimizer_sec"] = self._profile_now() - optimizer_start
+                profile_record["optimizer_update"] = True
+        elif profile_record is not None:
+            profile_record["optimizer_sec"] = 0.0
+            profile_record["optimizer_update"] = False
         for key, value in loss_dict.items():
             if "loss" not in key:
                 continue
             self.train_metric_wrapper.add(key, value, namespace="train")
+        empty_cache_start = self._profile_now() if profile_record is not None else None
         torch.cuda.empty_cache()
+        if profile_record is not None:
+            profile_record["empty_cache_sec"] = self._profile_now() - empty_cache_start
+            profile_record["train_step_sec"] = self._profile_now() - train_step_start
 
     def progress_bar(self, desc: str = ""):
         if DIST_WRAPPER.rank != 0:
@@ -356,8 +508,17 @@ class TrainRunner(object):
             if self.configs.eval_only or self.configs.eval_dump:
                 return
 
+        if self.profile_enabled:
+            self._profile_last_iter_end = self._profile_now()
         while True:
             for batch in self.train_dl:
+                iter_ready_time = self._profile_now() if self.profile_enabled else None
+                profile_record = None
+                if self.profile_enabled:
+                    profile_record = {
+                        "data_wait_sec": iter_ready_time - self._profile_last_iter_end,
+                    }
+                    profile_record.update(self._profile_batch_stats(batch))
                 is_update_step = (self.global_step + 1) % self.iters_to_accumulate == 0
                 is_last_step = (self.step + 1) == self.configs.max_steps
                 step_need_log = (self.step + 1) % self.configs.log_interval == 0
@@ -376,9 +537,20 @@ class TrainRunner(object):
                 step_need_eval &= is_update_step
                 step_need_save &= is_update_step
 
+                to_device_start = self._profile_now() if profile_record is not None else None
                 batch = to_device(batch, self.device)
+                if profile_record is not None:
+                    profile_record["to_device_sec"] = self._profile_now() - to_device_start
+                    profile_record["is_update_step"] = bool(is_update_step)
+                    profile_record["will_save_checkpoint"] = bool(step_need_save or is_last_step)
+                    profile_record["will_eval"] = bool(step_need_eval or is_last_step)
                 self.progress_bar()
-                self.train_step(batch)
+                self.train_step(batch, profile_record=profile_record)
+                if profile_record is not None:
+                    profile_record["microbatch_total_sec"] = (
+                        self._profile_now() - iter_ready_time
+                    )
+                    self._profile_write(profile_record)
                 if step_need_log or is_last_step:
                     metrics = self.train_metric_wrapper.calc()
                     self.print(f"Step {self.step} train: {metrics}")
@@ -404,5 +576,7 @@ class TrainRunner(object):
                 if self.step >= self.configs.max_steps:
                     self.print(f"Finish training after {self.step} steps")
                     break
+                if self.profile_enabled:
+                    self._profile_last_iter_end = self._profile_now()
             if self.step >= self.configs.max_steps:
                 break
