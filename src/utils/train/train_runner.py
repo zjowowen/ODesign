@@ -75,6 +75,9 @@ class TrainRunner(object):
             self.profile_all_ranks or DIST_WRAPPER.rank == 0
         )
         self.profile_sync_cuda = os.environ.get("ODESIGN_PROFILE_SYNC_CUDA", "1") != "0"
+        self.empty_cache_policy = self._normalize_empty_cache_policy(
+            os.environ.get("ODESIGN_EMPTY_CACHE_POLICY")
+        )
         self.profile_jsonl_path = None
         self._profile_last_iter_end = time.perf_counter()
         if self.profile_enabled:
@@ -89,6 +92,33 @@ class TrainRunner(object):
             self.profile_jsonl_path = base_path
 
         self.load_checkpoint()
+
+    @staticmethod
+    def _normalize_empty_cache_policy(value: str | None) -> str:
+        raw_value = (value or "").strip().lower()
+        if raw_value in ("", "1", "true", "yes", "always", "microbatch"):
+            return "microbatch"
+        if raw_value in ("optimizer", "optimizer_step", "optimizer_update"):
+            return "optimizer_update"
+        if raw_value in ("0", "false", "no", "off", "never", "disabled"):
+            return "never"
+        raise ValueError(
+            "ODESIGN_EMPTY_CACHE_POLICY must be one of "
+            "microbatch, optimizer_update, or never; got "
+            f"{value!r}"
+        )
+
+    @staticmethod
+    def _should_empty_cache_for_policy(
+        policy: str, optimizer_update: bool
+    ) -> bool:
+        if policy == "microbatch":
+            return True
+        if policy == "optimizer_update":
+            return optimizer_update
+        if policy == "never":
+            return False
+        raise ValueError(f"Unknown empty_cache policy: {policy!r}")
 
     def _profile_now(self) -> float:
         if (
@@ -445,6 +475,7 @@ class TrainRunner(object):
         if profile_record is not None:
             profile_record["backward_sec"] = self._profile_now() - backward_start
 
+        did_optimizer_update = False
         # For simplicity, the global training step is used
         if (self.global_step + 1) % self.iters_to_accumulate == 0:
             self.print(
@@ -459,6 +490,7 @@ class TrainRunner(object):
             scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
+            did_optimizer_update = True
             if profile_record is not None:
                 profile_record["optimizer_sec"] = self._profile_now() - optimizer_start
                 profile_record["optimizer_update"] = True
@@ -469,9 +501,16 @@ class TrainRunner(object):
             if "loss" not in key:
                 continue
             self.train_metric_wrapper.add(key, value, namespace="train")
+
+        should_empty_cache = self._should_empty_cache_for_policy(
+            self.empty_cache_policy, did_optimizer_update
+        )
         empty_cache_start = self._profile_now() if profile_record is not None else None
-        torch.cuda.empty_cache()
+        if should_empty_cache:
+            torch.cuda.empty_cache()
         if profile_record is not None:
+            profile_record["empty_cache_policy"] = self.empty_cache_policy
+            profile_record["empty_cache_called"] = bool(should_empty_cache)
             profile_record["empty_cache_sec"] = self._profile_now() - empty_cache_start
             profile_record["train_step_sec"] = self._profile_now() - train_step_start
 

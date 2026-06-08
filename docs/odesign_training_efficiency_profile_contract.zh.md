@@ -181,6 +181,7 @@ conda activate odesign
 - 远端 record dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/effprof_2gpu_baseline_20260608_r1`。
 - 关键结论：该 2GPU baseline 不是 data-wait bottleneck；排除 cold-start 后 microbatch mean 约 `55s`，主要瓶颈在 forward/backward compute 和 checkpoint/recompute 路径。
 - 不建议直接扩大同配置到 50-100 optimizer updates；20 updates 已有 200 条 rank-level profiling 记录，继续同配置长跑的边际信息增益低于针对瓶颈做 E2 对照。
+- E2 targeted profiling 已记录在 `docs/odesign_training_efficiency_e2_profile_20260608.zh.md`。E2A 已排除 `ODESIGN_PROFILE_SYNC_CUDA=1` 是主要开销；E2B/E2C 显示降低或关闭 `TrainRunner.train_step()` 末尾 `torch.cuda.empty_cache()` 只带来约 `1.0-1.2%` 的 10-update 短跑 wall-time 改善，不是主瓶颈。
 
 ### E2：最小变量 sweep
 

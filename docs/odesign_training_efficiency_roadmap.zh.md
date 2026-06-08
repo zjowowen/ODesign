@@ -346,3 +346,16 @@ rank0 汇总：
    - `empty_cache`、`diffusion_lddt_chunk_size`、`blocks_per_ckpt`、`num_dl_workers`。
 
 当前不建议直接启动大规模正式效率训练。先拿到固定资源/固定数据下的 profiling baseline，再决定哪些优化值得进入“跑到 PBP 达标 checkpoint”的长训验证。
+
+## 2026-06-09 E2 更新
+
+E2 targeted profiling 已完成两项低风险检查：
+
+- `ODESIGN_PROFILE_SYNC_CUDA=0` 对照没有显著改变稳态 microbatch time，profiling CUDA sync 不是主要瓶颈。
+- `TrainRunner.train_step()` 末尾 `torch.cuda.empty_cache()` 从每 microbatch 调整为每 optimizer update 或关闭后，10 update 短跑 wall time 约改善 `1.0-1.2%`，但 forward/backward 仍占绝大多数时间。
+
+因此，后续效率研发的优先级应前移到：
+
+1. `exp.loss.diffusion_lddt_chunk_size`：先试 `1 -> 2`，如果显存仍安全再试 `4`。
+2. activation checkpoint granularity：先定位 Pairformer / diffusion transformer / fine-grained checkpoint 的重算占比，再做 `blocks_per_ckpt` sweep。
+3. 对通过 profiling 的候选配置，再进入短训质量 gate 和 PBP/ODesignBench gate。
