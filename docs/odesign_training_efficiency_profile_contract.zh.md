@@ -94,11 +94,11 @@ conda activate odesign
 
 必须可访问的资产：
 
-- `data/indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_4.csv`
-- `data/mmcif/`
-- `data/mmcif_bioassembly/`
-- `data/mmcif_msa/`
-- `data/seq_to_pdb_index.json`
+- `indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_4.csv`
+- `mmcif/`
+- `mmcif_bioassembly/`
+- `mmcif_msa/`
+- `seq_to_pdb_index.json`
 - `ckpt/protenix_base_default_v0.5.0.pt`
 
 首轮 profiling 默认不做 PBP 质量判定，因此不需要完整跑到 PBP target。若进入 short quality run，则必须另行声明：
