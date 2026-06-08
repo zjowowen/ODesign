@@ -173,6 +173,15 @@ conda activate odesign
 - 至少 20 个 optimizer update 无 OOM、无 NaN、无非零退出。
 - rank0 写出 profiling JSONL 或 stdout 里有足够解析的 step timing。
 
+当前状态：
+
+- 已完成一次 2GPU H200 baseline profiling：`effprof_2gpu_baseline_20260608_r1`。
+- 结果：`returncode=0`，20 optimizer updates，100 microbatches/rank，最终 checkpoint `19.pt`。
+- 详细记录：`docs/odesign_training_efficiency_e1_profile_20260608.zh.md`。
+- 远端 record dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/effprof_2gpu_baseline_20260608_r1`。
+- 关键结论：该 2GPU baseline 不是 data-wait bottleneck；排除 cold-start 后 microbatch mean 约 `55s`，主要瓶颈在 forward/backward compute 和 checkpoint/recompute 路径。
+- 不建议直接扩大同配置到 50-100 optimizer updates；20 updates 已有 200 条 rank-level profiling 记录，继续同配置长跑的边际信息增益低于针对瓶颈做 E2 对照。
+
 ### E2：最小变量 sweep
 
 只有 E1 稳定后才进入 E2。
