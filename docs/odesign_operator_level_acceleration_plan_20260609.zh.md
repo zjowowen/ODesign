@@ -219,6 +219,7 @@ export ODESIGN_TORCH_PROFILER_REPEAT=1
 已在真实 2GPU ODesign 训练 trace 中进一步验证：
 
 - `operator_profile_2gpu_1upd_20260609_r1`：`returncode=0`，rank0 写出约 `2.07GB` PyTorch trace。
+- `operator_profile_2gpu_1upd_20260610_r2_light_v2`：`returncode=0`，关闭 `record_shapes/profile_memory` 且 `ACTIVE=1`，rank0 写出约 `738MB` PyTorch trace；热点排序与 r1 基本一致。
 - `docs/odesign_operator_level_profile_20260609.zh.md` 记录了 run 合同、range 表、top kernel/op 表和结论边界。
 - Pairformer openfold-local attention 在生产配置中确认走 `odesign.openfold_attention.deepspeed_evo`，`stock` branch 为 `0`。
 

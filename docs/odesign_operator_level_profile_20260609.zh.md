@@ -24,6 +24,7 @@
 - Evo attention 的 GPU kernel 也被捕获：`attention_kernel_batched_impl<AttentionKernel<...>>` 出现 `1512` 次，GPU kernel total 约 `6687ms`；attention backward kernel 出现 `216` 次，约 `3433ms`。
 - `record_function` 的 `user_annotation` range 显示最重的子路径集中在 MSA stack、triangle multiplication、attention pair bias、triangle attention 和 transition。
 - 全局 top event 里有大量 `aten::copy_`、`aten::to`、`aten::_to_copy`、`aten::item`、layer norm kernel、NCCL all-reduce 和 `cudaStreamSynchronize`。这些是下一步排查 runtime/layout/sync 的候选，但还不能直接 claim 某个优化一定有效。
+- 2026-06-10 已补轻量 r2 trace 复现实验，关闭 `record_shapes/profile_memory` 且 active window 从 `2` 降到 `1`。r2 的 trace 更小，热点排序仍和 r1 一致。
 
 直接决策：
 
@@ -128,6 +129,61 @@ Profiler env：
 - Pairformer 仍是 forward 主成本：`13.293s / 16.533s = 80.4%`。
 - `microbatch_total_sec` 的 max 很高，主要因为 torch profiler active/export 对个别 microbatch 造成额外开销；不要把它当作真实训练 step time。
 
+## 轻量复现实验 r2
+
+为了确认 r1 的热点不是单个 profiler active window 的偶然结果，2026-06-10 补跑了轻量 r2：
+
+| item | r1 | r2 |
+| --- | --- | --- |
+| run id | `operator_profile_2gpu_1upd_20260609_r1` | `operator_profile_2gpu_1upd_20260610_r2_light_v2` |
+| returncode | `0` | `0` |
+| elapsed | `567s` | `406s` |
+| profiler active | `2` | `1` |
+| record shapes | `1` | `0` |
+| profile memory | `1` | `0` |
+| profile rows | `5/rank` | `5/rank` |
+| trace size | `2069404856` bytes | `737685016` bytes |
+| X events | `4226492` | `2167813` |
+| matched ODesign ranges | `26706` | `13353` |
+| attention forward kernel count | `1512` | `756` |
+| `deepspeed_evo` grep count | `3024` | `1512` |
+| `stock` grep count | `0` | `0` |
+
+r2 record dir：
+
+```text
+/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/module-profile-runtime-0609/ODesign/.cluster_operator/operator_profile_2gpu_1upd_20260610_r2_light_v2
+```
+
+r2 module-level 同步观察：
+
+| field | r1 mean | r2 mean |
+| --- | ---: | ---: |
+| `forward_sec` | `16.533s` | `16.469s` |
+| `backward_sec` | `27.355s` | `27.442s` |
+| `module_profile_pairformer_sec` | `13.293s` | `13.296s` |
+| `module_profile_diffusion_sec` | `2.958s` | `2.909s` |
+| `microbatch_total_sec` | `72.454s` | `54.078s` |
+
+r2 的 `microbatch_total_sec` 明显低于 r1，主要符合轻量 profiler 设置预期；但它仍是带 profiler 的诊断 run，不用于真实吞吐结论。
+
+r2 前排 range 和 r1 一致：
+
+| rank | r1 top range | r2 top range |
+| ---: | --- | --- |
+| 1 | `odesign.msa_block.msa_stack` | `odesign.msa_block.msa_stack` |
+| 2 | `odesign.msa_module.blocks` | `odesign.triangle_multiplication.projections` |
+| 3 | `odesign.pairformer_block.tri_mul_in` | `odesign.msa_module.blocks` |
+| 4 | `odesign.triangle_multiplication.projections` | `odesign.pairformer_block.tri_mul_in` |
+| 5 | `odesign.pairformer_block.tri_mul_out` | `odesign.pairformer_block.tri_mul_out` |
+| 6 | `odesign.triangle_multiplication.output` | `odesign.pairformer_block.attention_pair_bias` |
+| 7 | `odesign.pairformer_block.attention_pair_bias` | `odesign.triangle_multiplication.output` |
+| 8 | `odesign.pairformer_block.tri_att_start` | `odesign.pairformer_block.tri_att_start` |
+
+解读：r2 数量约为 r1 的一半，因为 active window 从 2 个 microbatch 变为 1 个 microbatch；热点集合和排序基本稳定。下一步可以把优化候选集中到 triangle multiplication、attention pair bias/mask/layout、transition/layernorm/copy/sync 审计，而不是继续重复大 trace。
+
+备注：第一次 r2_light 因遗漏 `CUTLASS_PATH=/root/Github/cutlass` 被手动中止并标记，未作为结果使用；有效复现实验是 `r2_light_v2`。
+
 ## ODesign Range 表
 
 下面表来自 `scripts/summarize_torch_trace.py`，只统计 `category=user_annotation` 的 `odesign.*` ranges，避免把 `user_annotation` 和 `gpu_user_annotation` 双计。
@@ -215,7 +271,8 @@ Profiler env：
 | local unit test | `python3 tests/test_torch_trace_summary.py`: `Ran 2 tests OK` |
 | local py_compile | `python3 -m py_compile scripts/summarize_torch_trace.py tests/test_torch_trace_summary.py` |
 | remote unit test | H200 runtime `python3 tests/test_torch_trace_summary.py`: `Ran 2 tests OK` |
-| real trace parse | `2.07GB` trace，`4226492` X events，`26706` matched ODesign user ranges，29 秒完成 |
+| real trace parse r1 | `2.07GB` trace，`4226492` X events，`26706` matched ODesign user ranges，29 秒完成 |
+| real trace parse r2 | `738MB` trace，`2167813` X events，`13353` matched ODesign user ranges，14 秒完成 |
 
 ## 边界
 
@@ -229,8 +286,7 @@ Profiler env：
 
 建议按以下顺序继续：
 
-1. 补一个轻量 r2 trace：`ACTIVE=1`，`RECORD_SHAPES=0`，`PROFILE_MEMORY=0`，训练 setting 不变。目标是生成更小 trace，核对 r1 的热点排序是否稳定。
-2. 审计 `aten::item` / `_local_scalar_dense` 来源，判断是否来自训练日志/跳坏样本/条件分支/profiler，而不是核心数学路径。
-3. 审计 `aten::to` / `_to_copy` / `copy_` 来源，优先检查 Pairformer triangle attention 的 mask/bias、transpose、contiguous、dtype 转换。
-4. 从一个低风险局部候选开始，例如 attention bias/mask materialization 或 transition gate 局部 fusion；先做 G1 单模块 allclose，再做 G2 真实 batch 单 step allclose。
-5. 数值通过后再做无 profiler speed run，比较同一训练 setting 下的 mean/p50/p90 和 peak memory。
+1. 审计 `aten::item` / `_local_scalar_dense` 来源，判断是否来自训练日志/跳坏样本/条件分支/profiler，而不是核心数学路径。
+2. 审计 `aten::to` / `_to_copy` / `copy_` 来源，优先检查 Pairformer triangle attention 的 mask/bias、transpose、contiguous、dtype 转换。
+3. 从一个低风险局部候选开始，例如 attention bias/mask materialization 或 transition gate 局部 fusion；先做 G1 单模块 allclose，再做 G2 真实 batch 单 step allclose。
+4. 数值通过后再做无 profiler speed run，比较同一训练 setting 下的 mean/p50/p90 和 peak memory。
