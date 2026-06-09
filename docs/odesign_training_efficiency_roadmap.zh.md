@@ -125,9 +125,38 @@
 - 首轮证据显示该配置不是 data-wait bottleneck；排除 cold-start 后 microbatch mean 约 `52-55s`，主要瓶颈在 forward/backward compute 和 checkpoint/recompute 路径。
 - 50-update 扩展满足 Phase 0 对 50-100 optimizer update 连续 profiling 的低端要求；如继续做 100-update，应把它定义为额外稳定性确认，而不是当前 E1 gate 的必要条件。
 
-### Phase 1：低风险配置优化
+### Phase 1：固定训练 setting 的算子级优化
 
-目标：不改模型语义，先通过配置找到在同一资源/数据合同下更快写出 checkpoint 的速度/显存折中。
+目标：在不改变模型训练 setting 的前提下，通过 operator-level profiling、kernel dispatch 审计、tensor layout 和等价实现优化提升 forward/backward 速度。
+
+当前阶段的硬约束：
+
+- 不改变 forward 实际经过的模型模块。
+- 不改变 loss、训练数据、sampler、crop、augmentation、batch、gradient accumulation、diffusion batch、checkpoint/eval 节奏。
+- 不改变模型参数 dtype、训练 dtype、TF32/AMP/DeepSpeed Evo attention 等既有精度策略。
+- 不把 activation checkpoint granularity、`diffusion_lddt_chunk_size`、`train_batch_size` 等 memory-speed tradeoff 当作第一批实验。
+
+首要交付物是 `docs/odesign_operator_level_acceleration_plan_20260609.zh.md` 中定义的 operator-level attribution，而不是配置 sweep。
+
+候选方向：
+
+| 类型 | 例子 | 要求 |
+| --- | --- | --- |
+| operator profiling | PyTorch profiler、NVTX ranges、record_shapes | 只在 profiling 模式打开，不改变默认训练路径 |
+| attention/kernel dispatch 审计 | 确认 Pairformer 主路径是否真实使用 DeepSpeed Evo attention 或 fallback 到 stock matmul/softmax | 先审计，不先切换精度或数学路径 |
+| tensor layout 优化 | 减少重复 `transpose`、`contiguous`、mask/bias materialize | forward/grad allclose |
+| 等价局部融合 | gate、silu、mask multiply、bias add、transition 子路径 | 单模块和真实 batch 数值 gate 通过 |
+| 局部 compile | 只对纯局部 helper 或小模块尝试 | 不为 compile 改模型路径；记录 warmup 后速度 |
+
+通过标准：
+
+- Phase A 先给出 Pairformer/MSA 子阶段和 top CUDA kernels 的 attribution。
+- Phase B 每个候选必须通过 forward/loss/grad/参数更新 allclose gate。
+- 无 profiler speed run 需要同时报告 warmup 后 step time、显存峰值和 loss finite。
+
+### Phase 2：低风险配置优化
+
+目标：在完成固定 setting 的算子级诊断后，再通过配置找到同一资源/数据合同下更快写出 checkpoint 的速度/显存折中。
 
 候选变量：
 
@@ -157,7 +186,7 @@
 4. `num_dl_workers` sweep：确认是否 data-bound。
 5. `train_batch_size` 和 `diffusion_batch_size` 组合 sweep：寻找单卡显存上限和有效吞吐上限。
 
-### Phase 2：Profiling 驱动的代码级优化
+### Phase 3：Profiling 驱动的代码级优化
 
 目标：根据 Phase 0/1 的证据，对明确瓶颈做代码改造，以缩短固定资源/固定数据下的 `time_to_target_checkpoint`。
 
@@ -190,7 +219,7 @@
    - 比较 DeepSpeed Evo attention on/off、bf16/TF32 路径。
    - 保留 strict replay 和 production training 的边界：性能路径可以用 TF32/DS kernel，等价性诊断不能混用。
 
-### Phase 3：分布式和资源效率优化
+### Phase 4：分布式和资源效率优化
 
 目标：分别建立不同资源合同下的 time-to-target 曲线。该阶段不是用更多卡直接赢过更少卡，而是回答“在给定卡数和节点数时，哪套训练配置最快达标”。
 
@@ -215,7 +244,7 @@
 - 如果 16GPU 长时间难调度，而 4/8GPU 在其自身资源合同下能更快稳定产出达标 checkpoint，可以考虑阶段性使用少卡高利用率训练；但这属于不同资源合同之间的研发策略比较，不应混入同一合同内的主指标。
 - 如果跨节点通信占比过高，优先优化 batch/accumulation 或单节点吞吐，而不是盲目扩大 world size。
 
-### Phase 4：收敛效率和质量闭环
+### Phase 5：收敛效率和质量闭环
 
 目标：证明候选效率配置能更快产出 PBP 达标 checkpoint，而不是只在短跑中更快。
 
@@ -307,22 +336,23 @@ rank0 汇总：
 
 ## 优先路线建议
 
-第一轮不建议直接改模型结构。推荐路线是：
+第一轮不建议直接改模型结构，也不建议先改训练 setting。推荐路线是：
 
 1. 加 profiling/instrumentation，证明瓶颈。
-2. 在一个固定资源合同上做低成本 config sweep，例如先选 `1 node x 4 GPU` 或 `1 node x 8 GPU`。
-3. 找到 2-3 个 Pareto 候选配置。
-4. 对候选配置跑到若干 checkpoint，并做 PBP/ODesignBench 评测。
-5. 比较同一资源/数据合同下的 `time_to_target_checkpoint`。
-6. 再决定是否推广到其他资源合同或做代码级优化。
+2. 在固定训练 setting 下做 operator-level attribution，先拆 Pairformer/MSA 的具体热点。
+3. 只对 top 热点做等价算子/runtime 优化候选，并通过 forward/loss/grad/参数更新 allclose gate。
+4. 再进入无 profiler speed run，比较同一资源/数据合同下的 microbatch time 和显存峰值。
+5. 对通过 speed/memory gate 的候选跑到若干 checkpoint，并做 PBP/ODesignBench 评测。
+6. 比较同一资源/数据合同下的 `time_to_target_checkpoint`。
+7. 再决定是否推广到其他资源合同或进入配置 sweep。
 
 最优先的具体问题：
 
-1. `torch.cuda.empty_cache()` 每个 microbatch 调用是否显著拖慢训练。
-2. `diffusion_lddt_chunk_size=1` 是否过度保守。
-3. `blocks_per_ckpt=1` 和 fine-grained checkpoint 是否造成过多重算。
-4. 当前训练是否 data-bound，`num_dl_workers=4` 是否足够。
-5. `train_batch_size=2` 是否已经是 H200 上的吞吐/显存最优点。
+1. Pairformer forward 里 triangle multiplication、triangle attention、transition、single attention/pair bias 分别占多少。
+2. Pairformer backward 剩余时间里有多少来自 activation checkpoint recompute、attention kernel、matmul/einsum、transpose/contiguous 或 autograd 调度。
+3. `use_deepspeed_evo_attention=true` 是否真实落到 Pairformer triangle attention 主路径，是否存在 fallback 或 build/cache 问题。
+4. 是否存在可等价减少的 mask/bias materialize、layout conversion、无用同步或重复 kernel launch。
+5. 只有上述证据不足或已优化后，再回到 `blocks_per_ckpt`、`diffusion_lddt_chunk_size`、batch 等配置变量。
 
 ## 风险和边界
 
@@ -337,14 +367,16 @@ rank0 汇总：
 
 建议下一份文档/实现是：
 
-1. `training_efficiency_profile_contract.zh.md`
-   - 定义第一轮 profiling run 的资源合同、数据合同、PBP target、配置、命令、日志 schema、成功/失败条件。
-2. profiling instrumentation 小改动
-   - 只在配置开关打开时记录计时，不改变默认训练语义。
-3. 1GPU 和 4GPU baseline profile
-   - 得到第一份 step breakdown 和 GPU memory 证据。
-4. 第一轮 config sweep
-   - `empty_cache`、`diffusion_lddt_chunk_size`、`blocks_per_ckpt`、`num_dl_workers`。
+1. `docs/odesign_operator_level_acceleration_plan_20260609.zh.md`
+   - 明确固定训练 setting 的边界、允许优化类型、数值 gate、速度 gate 和质量 gate。
+2. operator-level profiling instrumentation
+   - 只在配置开关打开时记录 PyTorch profiler/NVTX ranges，不改变默认训练语义。
+3. 2GPU H200 operator trace
+   - 在现有 baseline setting 下跑 1-2 optimizer update，拆 Pairformer/MSA 子阶段和 top CUDA kernels。
+4. `docs/odesign_operator_level_profile_YYYYMMDD.zh.md`
+   - 汇总 triangle multiplication、triangle attention、transition、single attention/pair bias、outer product mean 和 kernel-level attribution。
+5. 等价优化候选设计
+   - 只针对 top-1/top-2 热点提出候选，并先跑 forward/loss/grad/参数更新 allclose gate。
 
 当前不建议直接启动大规模正式效率训练。先拿到固定资源/固定数据下的 profiling baseline，再决定哪些优化值得进入“跑到 PBP 达标 checkpoint”的长训验证。
 
@@ -358,9 +390,10 @@ E2 targeted profiling 已完成两项低风险检查：
 
 因此，后续效率研发的优先级应前移到：
 
-1. activation checkpoint granularity：先定位 Pairformer / diffusion transformer / fine-grained checkpoint 的重算占比，再做 `blocks_per_ckpt` sweep。
-2. 针对 forward/backward compute path 做更细粒度 profiling，而不是继续扩大 profiling overhead 或 lDDT chunk sweep。
-3. 对通过 profiling 的候选配置，再进入短训质量 gate 和 PBP/ODesignBench gate。
+1. 针对 forward/backward compute path 做更细粒度 profiling，先拆 Pairformer/MSA operator 和 top CUDA kernels。
+2. 在固定训练 setting 下设计等价 operator/runtime 优化候选，而不是继续扩大 profiling overhead 或 lDDT chunk sweep。
+3. activation checkpoint granularity 和 `blocks_per_ckpt` sweep 暂缓到后续配置优化阶段；只有 operator-level attribution 证明重算是主瓶颈时再推进。
+4. 对通过数值 gate 和 speed/memory gate 的候选，再进入短训质量 gate 和 PBP/ODesignBench gate。
 
 ## 2026-06-09 Module-Level Profiling 更新
 
@@ -373,8 +406,15 @@ Module-level profiling 已完成，详见 `docs/odesign_module_level_profile_202
 - Backward hook 近似里 Pairformer 平均 `9.830s`，MSA 平均 `3.228s`，是已观测 hook 时间中最大的两项。
 - 该 profiling 是诊断模式，包含 CUDA sync、stage memory peak 和 backward hook 开销；用于归因，不用于无 instrumentation 真实吞吐结论。
 
-因此下一轮优先级进一步收敛为：
+2026-06-09 用户进一步明确：训练效率优化第一阶段应保持训练 setting 不变，通过算子和 runtime 加速提升 forward/backward 速度。因此下面这条 module-level profile 后的早期建议被暂缓：
 
-1. `exp.model.blocks_per_ckpt` sweep：`1 -> 2 -> 4 -> None`，每个候选记录 speed + memory + loss finite。
-2. 如果 sweep 不能解释或改善 backward 剩余成本，再升级到 PyTorch profiler/NVTX trace。
-3. 只有通过 speed/memory gate 的候选，才进入短训质量 gate 和 PBP/ODesignBench gate。
+- 暂缓：`exp.model.blocks_per_ckpt` sweep：`1 -> 2 -> 4 -> None`。
+- 原因：它虽然不改变模型函数本身，但会改变 activation checkpoint/recompute 策略，属于训练 runtime setting 变量，不适合作为“固定训练 setting”阶段的第一批实验。
+
+新的下一轮优先级：
+
+1. 按 `docs/odesign_operator_level_acceleration_plan_20260609.zh.md` 做 PyTorch profiler/NVTX operator-level attribution。
+2. 把 Pairformer/MSA 拆到 triangle multiplication、triangle attention、transition、single attention/pair bias、outer product mean 和 top CUDA kernels。
+3. 只对 top-1/top-2 热点设计等价算子/runtime 优化候选。
+4. 候选先通过 forward/loss/grad/参数更新 allclose gate，再做无 profiler speed run。
+5. 通过 speed/memory gate 后，再进入短训质量 gate 和 PBP/ODesignBench gate。

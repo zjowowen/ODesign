@@ -190,6 +190,8 @@ conda activate odesign
 
 只有 E1 稳定后才进入 E2。
 
+2026-06-09 更新：下面的变量 sweep 是首轮 profiling 合同里的历史建议。用户已进一步明确训练效率优化第一阶段应保持训练 setting 不变，因此 `diffusion_lddt_chunk_size`、`blocks_per_ckpt`、`num_dl_workers` 等配置 sweep 暂缓；当前优先级改为 `docs/odesign_operator_level_acceleration_plan_20260609.zh.md` 中定义的 operator-level attribution 和等价算子/runtime 优化。
+
 建议顺序：
 
 1. `torch.cuda.empty_cache()` 频率：每 microbatch、每 optimizer step、关闭。

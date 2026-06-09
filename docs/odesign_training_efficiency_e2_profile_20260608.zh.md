@@ -237,6 +237,8 @@ profile_steps_rank01.jsonl rows 50 called 0 updates 10 max_empty_sec 0.0016
 - `TrainRunner.train_step()` 末尾的 `empty_cache` 单次约 `0.35-0.40s`；E2B/E2C 证明降低或关闭该处调用可带来约 `1.0-1.2%` 的短跑 wall-time 改善，但不是主瓶颈。
 - E2D 显示 `diffusion_lddt_chunk_size=2` 没有带来 wall-time 改善，且显存明显上升；下一优先级应转向 activation checkpoint granularity，而不是继续围绕 profiling overhead 或 lDDT chunk 做文章。
 
+2026-06-09 更新：上述“转向 activation checkpoint granularity”的结论是在尚未加入“固定训练 setting”约束前形成的历史判断。用户已明确第一阶段应通过算子和 runtime 加速提升 forward/backward 速度，因此当前下一优先级改为 PyTorch profiler/NVTX operator-level attribution；`blocks_per_ckpt` 和其他配置 sweep 暂缓到后续阶段。
+
 ## E2D：Diffusion lDDT Chunk Size 2
 
 目的：测试把 `exp.loss.diffusion_lddt_chunk_size` 从 `1` 提到 `2` 是否减少 lDDT loss 循环/重算开销。为了只改一个主要变量，E2D 以 E2C 为 baseline，保持 `ODESIGN_EMPTY_CACHE_POLICY=never` 和 `ODESIGN_PROFILE_SYNC_CUDA=0`。

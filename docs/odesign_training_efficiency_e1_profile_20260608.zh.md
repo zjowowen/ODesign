@@ -346,3 +346,5 @@ Explicit valence for atom # 8 O, 5, is greater than permitted
 3. `diffusion_lddt_chunk_size` sweep：`1 -> 2 -> 4`，观察显存是否仍可承受。
 4. activation checkpoint granularity sweep：优先看 diffusion/pairformer 的 recompute 开销。
 5. `diffusion_batch_size` sweep：在显存峰值接近 110GB 的前提下，谨慎评估 24/32/48，而不是先扩大。
+
+2026-06-09 更新：这组建议是 E1 之后的历史下一步。后续 E2/module-level profiling 已经进一步收敛到 Pairformer/MSA compute path；同时用户明确第一阶段应保持训练 setting 不变。因此当前优先级不是继续配置 sweep，而是按 `docs/odesign_operator_level_acceleration_plan_20260609.zh.md` 先做 operator-level attribution 和等价算子/runtime 优化。

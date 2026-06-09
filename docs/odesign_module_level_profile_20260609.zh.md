@@ -31,8 +31,9 @@
 直接决策：
 
 - 后续不应优先继续扩大 `empty_cache` 或 lDDT chunk sweep。E2 已显示它们不是主瓶颈。
-- 下一组最值得做的是 `exp.model.blocks_per_ckpt` sweep：`1 -> 2 -> 4 -> None`，先看 Pairformer/MSA checkpoint/recompute 的速度/显存 Pareto。
-- 每个候选必须记录 speed + memory + loss finite；如果某个候选显存不过线或 loss 异常，应停止该候选，不进入质量 gate。
+- 2026-06-09 用户进一步明确第一阶段应保持训练 setting 不变，通过算子和 runtime 加速提升 forward/backward 速度。因此 `exp.model.blocks_per_ckpt` sweep 暂缓；它仍是有价值的后续 memory-speed 变量，但不作为当前第一批实验。
+- 下一组最值得做的是 PyTorch profiler/NVTX operator-level attribution，把 Pairformer/MSA 拆到 triangle multiplication、triangle attention、transition、single attention/pair bias、outer product mean 和 top CUDA kernels。
+- 每个后续优化候选必须先通过 forward/loss/grad/参数更新 allclose gate，再记录 speed + memory + loss finite；如果某个候选数值不过线、显存不过线或 loss 异常，应停止该候选，不进入质量 gate。
 
 ## 运行合同
 
@@ -125,13 +126,15 @@ r5 之后正式短跑没有出现 `For backward hooks` warning，也没有 `Trac
 
 ## 下一步
 
-建议进入 `blocks_per_ckpt` sweep：
+2026-06-09 更新：在用户给定的“固定训练 setting”约束下，不再把 `blocks_per_ckpt` sweep 作为下一步第一优先级。它被移到后续配置优化阶段。
 
-| candidate | purpose | required evidence |
+新的下一步建议：
+
+| step | purpose | required evidence |
 | --- | --- | --- |
-| `blocks_per_ckpt=1` | 当前 baseline | speed/memory/loss finite 已有本轮证据 |
-| `blocks_per_ckpt=2` | 降低 Pairformer recompute | 10 update profile，显存峰值，loss finite |
-| `blocks_per_ckpt=4` | 更激进降低 recompute | 10 update profile，显存峰值，loss finite |
-| `blocks_per_ckpt=None` | 上界探针 | 先 smoke，若 OOM 则停止 |
+| operator-level profiler | 定位 Pairformer/MSA 内部具体热点 | PyTorch profiler/NVTX trace，top CUDA kernels，record_shapes |
+| Pairformer detail attribution | 拆 `tri_mul_out/in`、`tri_att_start/end`、`pair_transition`、`attention_pair_bias`、`single_transition` | rank0 summary table；不 claim 速度提升 |
+| MSA detail attribution | 拆 `outer_product_mean_msa`、`msa_stack`、inner `pair_stack` | rank0 summary table；解释 backward hook 中 MSA 成本 |
+| 等价优化候选 | 只针对 top-1/top-2 热点做 kernel/layout/runtime 优化 | forward/loss/grad/参数更新 allclose，speed/memory/loss finite |
 
-如果 `blocks_per_ckpt` sweep 证明显存可承受且速度改善明显，再进入短训质量 gate 和 PBP/ODesignBench gate；否则升级 profiler 解释 backward 剩余成本。
+如果 operator-level attribution 证明主要成本来自 activation checkpoint recompute，才把 `blocks_per_ckpt` sweep 作为后续配置优化阶段的候选，而不是当前固定 setting 阶段的默认下一步。
