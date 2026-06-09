@@ -121,8 +121,9 @@
 
 - 2026-06-08 已完成一次 2GPU H200 E1 baseline profiling，详见 `docs/odesign_training_efficiency_e1_profile_20260608.zh.md`。
 - 该 run 完成 20 optimizer updates，100 microbatches/rank，`returncode=0`。
-- 首轮证据显示该配置不是 data-wait bottleneck；排除 cold-start 后 microbatch mean 约 `55s`，主要瓶颈在 forward/backward compute 和 checkpoint/recompute 路径。
-- 因该 20-update run 已耗时约 `98.7min`，同配置扩大到 50-100 updates 的信息增益较低；下一步优先做针对性 E2 对照，而不是盲目延长同配置 profiling。
+- 2026-06-09 已按 E1 合同完成 50-update 扩展：`effprof_2gpu_baseline50_20260609_r1`，250 microbatches/rank，`returncode=0`，最终 checkpoint `49.pt`。
+- 首轮证据显示该配置不是 data-wait bottleneck；排除 cold-start 后 microbatch mean 约 `52-55s`，主要瓶颈在 forward/backward compute 和 checkpoint/recompute 路径。
+- 50-update 扩展满足 Phase 0 对 50-100 optimizer update 连续 profiling 的低端要求；如继续做 100-update，应把它定义为额外稳定性确认，而不是当前 E1 gate 的必要条件。
 
 ### Phase 1：低风险配置优化
 

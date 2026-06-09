@@ -177,10 +177,13 @@ conda activate odesign
 
 - 已完成一次 2GPU H200 baseline profiling：`effprof_2gpu_baseline_20260608_r1`。
 - 结果：`returncode=0`，20 optimizer updates，100 microbatches/rank，最终 checkpoint `19.pt`。
+- 已按合同完成 50-update 扩展：`effprof_2gpu_baseline50_20260609_r1`。
+- 结果：`returncode=0`，50 optimizer updates，250 microbatches/rank，最终 checkpoint `49.pt`。
 - 详细记录：`docs/odesign_training_efficiency_e1_profile_20260608.zh.md`。
 - 远端 record dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/effprof_2gpu_baseline_20260608_r1`。
-- 关键结论：该 2GPU baseline 不是 data-wait bottleneck；排除 cold-start 后 microbatch mean 约 `55s`，主要瓶颈在 forward/backward compute 和 checkpoint/recompute 路径。
-- 不建议直接扩大同配置到 50-100 optimizer updates；20 updates 已有 200 条 rank-level profiling 记录，继续同配置长跑的边际信息增益低于针对瓶颈做 E2 对照。
+- 50-update 远端 record dir：`/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/effprof_2gpu_baseline50_20260609_r1`。
+- 关键结论：该 2GPU baseline 不是 data-wait bottleneck；排除 cold-start 后 microbatch mean 约 `52-55s`，主要瓶颈在 forward/backward compute 和 checkpoint/recompute 路径。
+- 50-update 扩展已满足 E1 “稳定后扩大到 50-100 updates”的低端要求；如需继续扩大到 100 updates，应先说明新增信息需求，因为 50-update 已提供 500 条 rank-level profiling 记录。
 - E2 targeted profiling 已记录在 `docs/odesign_training_efficiency_e2_profile_20260608.zh.md`。E2A 已排除 `ODESIGN_PROFILE_SYNC_CUDA=1` 是主要开销；E2B/E2C 显示降低或关闭 `TrainRunner.train_step()` 末尾 `torch.cuda.empty_cache()` 只带来约 `1.0-1.2%` 的 10-update 短跑 wall-time 改善，不是主瓶颈。
 
 ### E2：最小变量 sweep
