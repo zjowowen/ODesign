@@ -353,9 +353,10 @@ E2 targeted profiling 已完成两项低风险检查：
 
 - `ODESIGN_PROFILE_SYNC_CUDA=0` 对照没有显著改变稳态 microbatch time，profiling CUDA sync 不是主要瓶颈。
 - `TrainRunner.train_step()` 末尾 `torch.cuda.empty_cache()` 从每 microbatch 调整为每 optimizer update 或关闭后，10 update 短跑 wall time 约改善 `1.0-1.2%`，但 forward/backward 仍占绝大多数时间。
+- `exp.loss.diffusion_lddt_chunk_size=2` 相比 `1` 没有带来 wall-time 改善，并显著增加 PyTorch allocator 峰值。
 
 因此，后续效率研发的优先级应前移到：
 
-1. `exp.loss.diffusion_lddt_chunk_size`：先试 `1 -> 2`，如果显存仍安全再试 `4`。
-2. activation checkpoint granularity：先定位 Pairformer / diffusion transformer / fine-grained checkpoint 的重算占比，再做 `blocks_per_ckpt` sweep。
+1. activation checkpoint granularity：先定位 Pairformer / diffusion transformer / fine-grained checkpoint 的重算占比，再做 `blocks_per_ckpt` sweep。
+2. 针对 forward/backward compute path 做更细粒度 profiling，而不是继续扩大 profiling overhead 或 lDDT chunk sweep。
 3. 对通过 profiling 的候选配置，再进入短训质量 gate 和 PBP/ODesignBench gate。

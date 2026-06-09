@@ -235,7 +235,40 @@ profile_steps_rank01.jsonl rows 50 called 0 updates 10 max_empty_sec 0.0016
 
 - 已排除 profiling CUDA sync 是主瓶颈。
 - `TrainRunner.train_step()` 末尾的 `empty_cache` 单次约 `0.35-0.40s`；E2B/E2C 证明降低或关闭该处调用可带来约 `1.0-1.2%` 的短跑 wall-time 改善，但不是主瓶颈。
-- 下一优先级应转向 `diffusion_lddt_chunk_size` 和 activation checkpoint granularity，而不是继续围绕 profiling overhead 做文章。
+- E2D 显示 `diffusion_lddt_chunk_size=2` 没有带来 wall-time 改善，且显存明显上升；下一优先级应转向 activation checkpoint granularity，而不是继续围绕 profiling overhead 或 lDDT chunk 做文章。
+
+## E2D：Diffusion lDDT Chunk Size 2
+
+目的：测试把 `exp.loss.diffusion_lddt_chunk_size` 从 `1` 提到 `2` 是否减少 lDDT loss 循环/重算开销。为了只改一个主要变量，E2D 以 E2C 为 baseline，保持 `ODESIGN_EMPTY_CACHE_POLICY=never` 和 `ODESIGN_PROFILE_SYNC_CUDA=0`。
+
+| 项目 | 值 |
+| --- | --- |
+| run id | `effprof_2gpu_lddtchunk2_20260608_r1` |
+| changed variable | `DIFFUSION_LDDT_CHUNK_SIZE=2` |
+| baseline compare | `effprof_2gpu_emptycache_never_20260608_r1` |
+| max steps | `10` |
+| `ODESIGN_EMPTY_CACHE_POLICY` | `never` |
+| `ODESIGN_PROFILE_SYNC_CUDA` | `0` |
+| record dir | `/mnt/shared-storage-user/ai4sreason/zhangjinouwen/Project/debug_5/ODesign/.cluster_operator/bestsetting-padding-runtime-0601/ODesign/.cluster_operator/effprof_2gpu_lddtchunk2_20260608_r1` |
+| returncode | `0` |
+| checkpoint | `9.pt` |
+| wall time | `2929s` |
+
+与 E2C 的稳态对比：
+
+| run | rank | rows | microbatch mean | forward mean | loss mean | backward mean | PyTorch max allocated | PyTorch max reserved |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| E2C chunk1 | rank0 | 49 | `54.84s` | `19.74s` | `0.120s` | `30.01s` | `92870 MiB` | `95434 MiB` |
+| E2C chunk1 | rank1 | 49 | `54.85s` | `20.08s` | `0.207s` | `30.22s` | `108785 MiB` | `111974 MiB` |
+| E2D chunk2 | rank0 | 49 | `54.90s` | `19.73s` | `0.102s` | `30.09s` | `98527 MiB` | `101014 MiB` |
+| E2D chunk2 | rank1 | 49 | `54.91s` | `20.06s` | `0.186s` | `30.32s` | `116422 MiB` | `119254 MiB` |
+
+解释：
+
+- E2D 没有 wall-time 改善：`2928s -> 2929s`，基本持平。
+- loss mean 小幅下降约 `0.02s`，但 loss 本身只占总 microbatch 的极小比例。
+- 显存明显上升，rank1 PyTorch max allocated 从约 `108.8GB` 上升到约 `116.4GB`。
+- 在当前配置下，`diffusion_lddt_chunk_size=2` 不是有效速度优化；继续试 `4` 可能进一步增加显存风险，信息增益低于 activation checkpoint/recompute sweep。
 
 ## Claim Boundary
 
@@ -246,6 +279,7 @@ profile_steps_rank01.jsonl rows 50 called 0 updates 10 max_empty_sec 0.0016
 - empty-cache 策略控制代码有标准库单元测试覆盖，并已同步到远端 runtime。
 - E2B 成功完成 10 optimizer updates，并验证 `optimizer_update` 策略实际生效。
 - E2C 成功完成 10 optimizer updates，并验证 `never` 策略实际生效；该 10 update 窗口内未出现 OOM。
+- E2D 成功完成 10 optimizer updates；`diffusion_lddt_chunk_size=2` 未带来速度改善，并增加显存。
 
 本文档不能支持：
 
