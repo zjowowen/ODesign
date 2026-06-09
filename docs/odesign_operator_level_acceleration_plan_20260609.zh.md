@@ -216,11 +216,17 @@ export ODESIGN_TORCH_PROFILER_REPEAT=1
 | profiler context smoke | `.cluster_operator/operator_profiler_context_smoke_0609/rank00/*.pt.trace.json` 写出 1 个 trace |
 | Pairformer range smoke | `.cluster_operator/operator_pairformer_range_smoke_0609/rank00/*.pt.trace.json` 写出 1 个 trace，trace 中包含 `odesign.pairformer_block.tri_mul_out`、`odesign.pairformer_block.tri_att_start`、`odesign.openfold_attention.stock` |
 
-未验证：
+已在真实 2GPU ODesign 训练 trace 中进一步验证：
 
-- 尚未跑真实 2GPU ODesign 训练 trace。
-- 尚未生成 Pairformer/MSA top CUDA kernel 表。
+- `operator_profile_2gpu_1upd_20260609_r1`：`returncode=0`，rank0 写出约 `2.07GB` PyTorch trace。
+- `docs/odesign_operator_level_profile_20260609.zh.md` 记录了 run 合同、range 表、top kernel/op 表和结论边界。
+- Pairformer openfold-local attention 在生产配置中确认走 `odesign.openfold_attention.deepspeed_evo`，`stock` branch 为 `0`。
+
+仍未验证：
+
 - 尚未设计或验证任何加速候选。
+- 尚未跑无 profiler 的 before/after speed benchmark。
+- 尚未证明任何优化对 PBP 或 time-to-target 有收益。
 
 ## Phase B：等价优化候选
 
