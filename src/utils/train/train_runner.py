@@ -78,11 +78,17 @@ class TrainRunner(object):
         self.profile_stage_cuda_peaks = (
             os.environ.get("ODESIGN_PROFILE_STAGE_CUDA_PEAKS", "0") == "1"
         )
+        self.profile_modules = os.environ.get("ODESIGN_PROFILE_MODULES", "0") == "1"
+        self.profile_module_backward = (
+            os.environ.get("ODESIGN_PROFILE_MODULE_BACKWARD", "1") != "0"
+        )
         self.empty_cache_policy = self._normalize_empty_cache_policy(
             os.environ.get("ODESIGN_EMPTY_CACHE_POLICY")
         )
         self.profile_jsonl_path = None
         self._profile_last_iter_end = time.perf_counter()
+        self._profile_module_backward_handles = []
+        self._profile_module_backward_starts = {}
         if self.profile_enabled:
             base_path = Path(self.profile_jsonl)
             if self.profile_all_ranks:
@@ -93,6 +99,8 @@ class TrainRunner(object):
                 )
             base_path.parent.mkdir(parents=True, exist_ok=True)
             self.profile_jsonl_path = base_path
+        if self.profile_enabled and self.profile_modules:
+            self._profile_setup_model_module_profiling()
 
         self.load_checkpoint()
 
@@ -131,6 +139,78 @@ class TrainRunner(object):
         ):
             torch.cuda.synchronize(self.device)
         return time.perf_counter()
+
+    def _profile_model(self) -> torch.nn.Module:
+        return getattr(self.model, "module", self.model)
+
+    def _profile_set_model_record(self, profile_record: dict | None) -> None:
+        self._profile_model()._odesign_profile_record = profile_record
+
+    def _profile_get_model_record(self) -> dict | None:
+        return getattr(self._profile_model(), "_odesign_profile_record", None)
+
+    def _profile_setup_model_module_profiling(self) -> None:
+        profile_model = self._profile_model()
+        profile_model._odesign_profile_enabled = True
+        profile_model._odesign_profile_sync_cuda = self.profile_sync_cuda
+        profile_model._odesign_profile_device = self.device
+        profile_model._odesign_profile_record = None
+        if not self.profile_module_backward:
+            return
+        self._profile_register_module_backward_hook(
+            "pairformer", profile_model.pairformer_stack
+        )
+        self._profile_register_module_backward_hook("msa", profile_model.msa_module)
+        self._profile_register_pairwise_backward_hooks(profile_model.pairwise_head)
+        self._profile_register_module_backward_hook(
+            "diffusion_module", profile_model.diffusion_module
+        )
+
+    def _profile_register_pairwise_backward_hooks(
+        self, pairwise_head: torch.nn.Module
+    ) -> None:
+        child_modules = [
+            getattr(pairwise_head, "distogram_head", None),
+            getattr(pairwise_head, "bond_type_head", None),
+        ]
+        registered_any = False
+        for child_module in child_modules:
+            if child_module is None:
+                continue
+            self._profile_register_module_backward_hook(
+                "pairwise_head", child_module
+            )
+            registered_any = True
+        if not registered_any:
+            self._profile_register_module_backward_hook(
+                "pairwise_head", pairwise_head
+            )
+
+    def _profile_register_module_backward_hook(
+        self, module_name: str, module: torch.nn.Module
+    ) -> None:
+        def pre_hook(module, grad_output):
+            record = self._profile_get_model_record()
+            if record is None:
+                return
+            self._profile_module_backward_starts[module_name] = self._profile_now()
+
+        def hook(module, grad_input, grad_output):
+            record = self._profile_get_model_record()
+            if record is None:
+                return
+            start = self._profile_module_backward_starts.pop(module_name, None)
+            if start is None:
+                return
+            key = f"module_profile_backward_{module_name}_sec"
+            record[key] = record.get(key, 0.0) + (self._profile_now() - start)
+
+        self._profile_module_backward_handles.append(
+            module.register_full_backward_pre_hook(pre_hook)
+        )
+        self._profile_module_backward_handles.append(
+            module.register_full_backward_hook(hook)
+        )
 
     def _profile_cuda_stage_enabled(self, profile_record: dict | None) -> bool:
         return (
@@ -254,6 +334,10 @@ class TrainRunner(object):
         record["global_step"] = int(self.global_step)
         record["timestamp"] = time.time()
         record["profile_stage_cuda_peaks"] = bool(self.profile_stage_cuda_peaks)
+        record["profile_modules"] = bool(self.profile_modules)
+        record["profile_module_backward"] = bool(
+            self.profile_modules and self.profile_module_backward
+        )
         if torch.cuda.is_available() and self.device.type == "cuda":
             record["gpu_mem_allocated_mib"] = (
                 torch.cuda.memory_allocated(self.device) / 1024**2
@@ -519,13 +603,29 @@ class TrainRunner(object):
         with enable_amp:
             forward_start = self._profile_now() if profile_record is not None else None
             self._profile_cuda_stage_begin(profile_record, "forward")
-            pred_output, ground_truth, loss_input = self.model_forward(batch, mode="train")
+            if self.profile_modules:
+                self._profile_set_model_record(profile_record)
+            try:
+                pred_output, ground_truth, loss_input = self.model_forward(
+                    batch, mode="train"
+                )
+            finally:
+                if self.profile_modules:
+                    self._profile_set_model_record(None)
             if profile_record is not None:
                 self._profile_cuda_stage_end(profile_record, "forward")
                 profile_record["forward_sec"] = self._profile_now() - forward_start
             loss_start = self._profile_now() if profile_record is not None else None
             self._profile_cuda_stage_begin(profile_record, "loss")
-            loss, loss_dict = self.get_loss(loss_input, pred_output, ground_truth, mode="train")
+            if self.profile_modules:
+                self._profile_set_model_record(profile_record)
+            try:
+                loss, loss_dict = self.get_loss(
+                    loss_input, pred_output, ground_truth, mode="train"
+                )
+            finally:
+                if self.profile_modules:
+                    self._profile_set_model_record(None)
             if profile_record is not None:
                 self._profile_cuda_stage_end(profile_record, "loss")
                 profile_record["loss_sec"] = self._profile_now() - loss_start
@@ -542,7 +642,13 @@ class TrainRunner(object):
                 loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
         backward_start = self._profile_now() if profile_record is not None else None
         self._profile_cuda_stage_begin(profile_record, "backward")
-        scaler.scale(loss / self.iters_to_accumulate).backward()
+        if self.profile_modules:
+            self._profile_set_model_record(profile_record)
+        try:
+            scaler.scale(loss / self.iters_to_accumulate).backward()
+        finally:
+            if self.profile_modules:
+                self._profile_set_model_record(None)
         if profile_record is not None:
             self._profile_cuda_stage_end(profile_record, "backward")
             profile_record["backward_sec"] = self._profile_now() - backward_start

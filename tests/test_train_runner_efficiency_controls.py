@@ -1,4 +1,5 @@
 import unittest
+import types
 from unittest import mock
 
 import torch
@@ -63,6 +64,117 @@ class TrainRunnerEfficiencyControlTests(unittest.TestCase):
         self.assertEqual(profile_record["forward_gpu_mem_end_reserved_mib"], 400 / 1024**2)
         self.assertEqual(profile_record["forward_gpu_mem_peak_allocated_mib"], 500 / 1024**2)
         self.assertEqual(profile_record["forward_gpu_mem_peak_reserved_mib"], 600 / 1024**2)
+
+    def test_module_profile_setup_registers_backward_hooks(self) -> None:
+        runner = mock.Mock()
+        runner.profile_sync_cuda = True
+        runner.profile_module_backward = True
+        runner.device = torch.device("cuda:0")
+        runner._profile_module_backward_handles = []
+        runner._profile_module_backward_starts = {}
+        runner._profile_now = mock.Mock(return_value=1.0)
+        runner._profile_model = lambda: runner.model.module
+        runner._profile_register_module_backward_hook = mock.Mock(
+            wraps=TrainRunner._profile_register_module_backward_hook.__get__(
+                runner, TrainRunner
+            )
+        )
+        runner._profile_register_pairwise_backward_hooks = (
+            TrainRunner._profile_register_pairwise_backward_hooks.__get__(
+                runner, TrainRunner
+            )
+        )
+        runner.model = types.SimpleNamespace(module=types.SimpleNamespace())
+        hook_handle = mock.Mock()
+
+        for module_name in [
+            "pairformer_stack",
+            "msa_module",
+            "pairwise_head",
+            "diffusion_module",
+        ]:
+            module = mock.Mock()
+            module.register_full_backward_pre_hook.return_value = hook_handle
+            module.register_full_backward_hook.return_value = hook_handle
+            setattr(runner.model.module, module_name, module)
+        runner.model.module.pairwise_head.distogram_head = mock.Mock()
+        runner.model.module.pairwise_head.bond_type_head = mock.Mock()
+
+        TrainRunner._profile_setup_model_module_profiling(runner)
+
+        self.assertIs(runner.model.module._odesign_profile_enabled, True)
+        self.assertIs(runner.model.module._odesign_profile_sync_cuda, True)
+        self.assertEqual(runner.model.module._odesign_profile_device, runner.device)
+        self.assertIsNone(runner.model.module._odesign_profile_record)
+        self.assertFalse(hasattr(runner.model, "_odesign_profile_enabled"))
+        self.assertEqual(len(runner._profile_module_backward_handles), 10)
+        registered_names = [
+            call.args[0]
+            for call in runner._profile_register_module_backward_hook.call_args_list
+        ]
+        self.assertEqual(
+            registered_names,
+            [
+                "pairformer",
+                "msa",
+                "pairwise_head",
+                "pairwise_head",
+                "diffusion_module",
+            ],
+        )
+
+    def test_module_backward_hook_accumulates_elapsed_time(self) -> None:
+        runner = mock.Mock()
+        runner._profile_module_backward_handles = []
+        runner._profile_module_backward_starts = {}
+        runner._profile_now = mock.Mock(side_effect=[2.0, 5.5, 6.0, 7.25])
+        record = {}
+        runner._profile_get_model_record = mock.Mock(return_value=record)
+        module = mock.Mock()
+        callbacks = {}
+
+        def register_pre_hook(callback):
+            callbacks["pre"] = callback
+            return mock.Mock()
+
+        def register_hook(callback):
+            callbacks["hook"] = callback
+            return mock.Mock()
+
+        module.register_full_backward_pre_hook.side_effect = register_pre_hook
+        module.register_full_backward_hook.side_effect = register_hook
+
+        TrainRunner._profile_register_module_backward_hook(
+            runner, "pairformer", module
+        )
+        callbacks["pre"](module, ())
+        callbacks["hook"](module, (), ())
+        callbacks["pre"](module, ())
+        callbacks["hook"](module, (), ())
+
+        self.assertEqual(record["module_profile_backward_pairformer_sec"], 4.75)
+
+    def test_profile_write_records_module_profile_flags(self) -> None:
+        runner = mock.Mock()
+        runner.profile_enabled = True
+        runner.profile_jsonl_path = mock.Mock()
+        runner.step = 2
+        runner.global_step = 13
+        runner.profile_stage_cuda_peaks = True
+        runner.profile_modules = True
+        runner.profile_module_backward = False
+        runner.device = torch.device("cpu")
+        mocked_open = mock.mock_open()
+        runner.profile_jsonl_path.open = mocked_open
+
+        TrainRunner._profile_write(runner, {"loss": 1.25})
+
+        handle = mocked_open()
+        handle.write.assert_called_once()
+        written = handle.write.call_args.args[0]
+        self.assertIn('"profile_modules": true', written)
+        self.assertIn('"profile_module_backward": false', written)
+        self.assertIn('"profile_stage_cuda_peaks": true', written)
 
 if __name__ == "__main__":
     unittest.main()

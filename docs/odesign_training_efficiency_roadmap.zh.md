@@ -361,3 +361,20 @@ E2 targeted profiling 已完成两项低风险检查：
 1. activation checkpoint granularity：先定位 Pairformer / diffusion transformer / fine-grained checkpoint 的重算占比，再做 `blocks_per_ckpt` sweep。
 2. 针对 forward/backward compute path 做更细粒度 profiling，而不是继续扩大 profiling overhead 或 lDDT chunk sweep。
 3. 对通过 profiling 的候选配置，再进入短训质量 gate 和 PBP/ODesignBench gate。
+
+## 2026-06-09 Module-Level Profiling 更新
+
+Module-level profiling 已完成，详见 `docs/odesign_module_level_profile_20260609.zh.md`。
+
+关键证据：
+
+- 正式短跑 `module_profile_2gpu_10upd_20260609_r1`：`returncode=0`，`50 rows/rank`，无 hook warning/error。
+- Forward 里 Pairformer 平均 `27.640s`，占 `forward` 的 `89.4%`；Diffusion 平均 `3.045s`，占 `forward` 的 `9.8%`。
+- Backward hook 近似里 Pairformer 平均 `9.830s`，MSA 平均 `3.228s`，是已观测 hook 时间中最大的两项。
+- 该 profiling 是诊断模式，包含 CUDA sync、stage memory peak 和 backward hook 开销；用于归因，不用于无 instrumentation 真实吞吐结论。
+
+因此下一轮优先级进一步收敛为：
+
+1. `exp.model.blocks_per_ckpt` sweep：`1 -> 2 -> 4 -> None`，每个候选记录 speed + memory + loss finite。
+2. 如果 sweep 不能解释或改善 backward 剩余成本，再升级到 PyTorch profiler/NVTX trace。
+3. 只有通过 speed/memory gate 的候选，才进入短训质量 gate 和 PBP/ODesignBench gate。
