@@ -28,6 +28,7 @@ from src.utils.model.misc import (
 )
 from src.utils.openfold_local.model.primitives import LayerNorm, trunc_normal_init_
 from src.utils.openfold_local.utils.chunk_utils import chunk_layer
+from src.utils.model.profiling import odesign_record_function
 
 
 class Linear(nn.Linear):
@@ -225,10 +226,13 @@ class Transition(nn.Module):
                 [..., c]
         """
         if self.training:
-            x = self.layernorm1(x)
-            a = self.linear_no_bias_a(x)
-            b = self.linear_no_bias_b(x)
-            x = self.linear_no_bias(F.silu(a) * b)
+            with odesign_record_function(self, "odesign.transition.layer_norm"):
+                x = self.layernorm1(x)
+            with odesign_record_function(self, "odesign.transition.projections"):
+                a = self.linear_no_bias_a(x)
+                b = self.linear_no_bias_b(x)
+            with odesign_record_function(self, "odesign.transition.gate_output"):
+                x = self.linear_no_bias(F.silu(a) * b)
             return x
         else:
             other_dims = x.shape[:-1]

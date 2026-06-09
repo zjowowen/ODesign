@@ -24,6 +24,7 @@ from src.utils.model.torch_utils import (
     to_device,
     filter_state_dict,
 )
+from src.utils.model.profiling import set_odesign_profile_detail_enabled
 from src.utils.permutation.permutation import SymmetricPermutation
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,29 @@ class TrainRunner(object):
         self.profile_module_backward = (
             os.environ.get("ODESIGN_PROFILE_MODULE_BACKWARD", "1") != "0"
         )
+        self.profile_pairformer_detail = (
+            os.environ.get("ODESIGN_PROFILE_PAIRFORMER_DETAIL", "0") == "1"
+        )
+        self.torch_profiler_dir = os.environ.get("ODESIGN_TORCH_PROFILER_DIR", "")
+        self.torch_profiler_all_ranks = (
+            os.environ.get("ODESIGN_TORCH_PROFILER_ALL_RANKS", "0") == "1"
+        )
+        self.torch_profiler_enabled = bool(self.torch_profiler_dir) and (
+            self.torch_profiler_all_ranks or DIST_WRAPPER.rank == 0
+        )
+        self.torch_profiler_wait = int(
+            os.environ.get("ODESIGN_TORCH_PROFILER_WAIT", "1")
+        )
+        self.torch_profiler_warmup = int(
+            os.environ.get("ODESIGN_TORCH_PROFILER_WARMUP", "1")
+        )
+        self.torch_profiler_active = int(
+            os.environ.get("ODESIGN_TORCH_PROFILER_ACTIVE", "2")
+        )
+        self.torch_profiler_repeat = int(
+            os.environ.get("ODESIGN_TORCH_PROFILER_REPEAT", "1")
+        )
+        self._torch_profiler = None
         self.empty_cache_policy = self._normalize_empty_cache_policy(
             os.environ.get("ODESIGN_EMPTY_CACHE_POLICY")
         )
@@ -101,6 +125,8 @@ class TrainRunner(object):
             self.profile_jsonl_path = base_path
         if self.profile_enabled and self.profile_modules:
             self._profile_setup_model_module_profiling()
+        if self.profile_pairformer_detail:
+            self._profile_setup_pairformer_detail_profiling()
 
         self.load_checkpoint()
 
@@ -165,6 +191,55 @@ class TrainRunner(object):
         self._profile_register_module_backward_hook(
             "diffusion_module", profile_model.diffusion_module
         )
+
+    def _profile_setup_pairformer_detail_profiling(self) -> None:
+        set_odesign_profile_detail_enabled(
+            self._profile_model(), self.profile_pairformer_detail
+        )
+
+    @staticmethod
+    def _profile_env_bool(name: str, default: bool) -> bool:
+        raw_value = os.environ.get(name)
+        if raw_value is None:
+            return default
+        return raw_value.strip().lower() in ("1", "true", "yes", "on")
+
+    def _profile_torch_profiler_context(self):
+        if not self.torch_profiler_enabled:
+            return nullcontext()
+
+        trace_dir = Path(self.torch_profiler_dir) / f"rank{DIST_WRAPPER.rank:02d}"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        return torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=self.torch_profiler_wait,
+                warmup=self.torch_profiler_warmup,
+                active=self.torch_profiler_active,
+                repeat=self.torch_profiler_repeat,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+            record_shapes=self._profile_env_bool(
+                "ODESIGN_TORCH_PROFILER_RECORD_SHAPES", True
+            ),
+            profile_memory=self._profile_env_bool(
+                "ODESIGN_TORCH_PROFILER_PROFILE_MEMORY", True
+            ),
+            with_stack=self._profile_env_bool(
+                "ODESIGN_TORCH_PROFILER_WITH_STACK", False
+            ),
+            with_modules=self._profile_env_bool(
+                "ODESIGN_TORCH_PROFILER_WITH_MODULES", True
+            ),
+        )
+
+    def _profile_torch_profiler_step(self) -> None:
+        if self._torch_profiler is not None:
+            self._torch_profiler.step()
 
     def _profile_register_pairwise_backward_hooks(
         self, pairwise_head: torch.nn.Module
@@ -338,6 +413,8 @@ class TrainRunner(object):
         record["profile_module_backward"] = bool(
             self.profile_modules and self.profile_module_backward
         )
+        record["profile_pairformer_detail"] = bool(self.profile_pairformer_detail)
+        record["torch_profiler_enabled"] = bool(self.torch_profiler_enabled)
         if torch.cuda.is_available() and self.device.type == "cuda":
             record["gpu_mem_allocated_mib"] = (
                 torch.cuda.memory_allocated(self.device) / 1024**2
@@ -729,6 +806,14 @@ class TrainRunner(object):
             if self.configs.eval_only or self.configs.eval_dump:
                 return
 
+        with self._profile_torch_profiler_context() as torch_profiler:
+            self._torch_profiler = torch_profiler
+            try:
+                self._run_training_loop()
+            finally:
+                self._torch_profiler = None
+
+    def _run_training_loop(self):
         if self.profile_enabled:
             self._profile_last_iter_end = self._profile_now()
         while True:
@@ -774,6 +859,7 @@ class TrainRunner(object):
                         self._profile_now() - iter_ready_time
                     )
                     self._profile_write(profile_record)
+                self._profile_torch_profiler_step()
                 if step_need_log or is_last_step:
                     metrics = self.train_metric_wrapper.calc()
                     self.print(f"Step {self.step} train: {metrics}")

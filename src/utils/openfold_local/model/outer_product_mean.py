@@ -31,6 +31,7 @@ import torch.nn as nn
 from src.utils.openfold_local.model.primitives import LayerNorm, Linear
 from src.utils.openfold_local.utils.chunk_utils import chunk_layer
 from src.utils.openfold_local.utils.precision_utils import is_fp16_enabled
+from src.utils.model.profiling import odesign_record_function
 
 
 class OuterProductMean(nn.Module):
@@ -119,15 +120,17 @@ class OuterProductMean(nn.Module):
             mask = m.new_ones(m.shape[:-1])
 
         # [*, N_seq, N_res, C_m]
-        ln = self.layer_norm(m)
+        with odesign_record_function(self, "odesign.outer_product_mean.layer_norm"):
+            ln = self.layer_norm(m)
 
         # [*, N_seq, N_res, C]
         mask = mask.unsqueeze(-1)
-        a = self.linear_1(ln)
-        a = a * mask
+        with odesign_record_function(self, "odesign.outer_product_mean.projections"):
+            a = self.linear_1(ln)
+            a = a * mask
 
-        b = self.linear_2(ln)
-        b = b * mask
+            b = self.linear_2(ln)
+            b = b * mask
 
         del ln
 
@@ -135,13 +138,16 @@ class OuterProductMean(nn.Module):
         b = b.transpose(-2, -3)
 
         if chunk_size is not None:
-            outer = self._chunk(a, b, chunk_size)
+            with odesign_record_function(self, "odesign.outer_product_mean.chunk"):
+                outer = self._chunk(a, b, chunk_size)
         else:
-            outer = self._opm(a, b)
+            with odesign_record_function(self, "odesign.outer_product_mean.outer"):
+                outer = self._opm(a, b)
 
         # [*, N_res, N_res, 1]
-        norm = torch.einsum("...abc,...adc->...bdc", mask, mask)
-        norm = norm + self.eps
+        with odesign_record_function(self, "odesign.outer_product_mean.norm"):
+            norm = torch.einsum("...abc,...adc->...bdc", mask, mask)
+            norm = norm + self.eps
 
         # [*, N_res, N_res, C_z]
         if inplace_safe:

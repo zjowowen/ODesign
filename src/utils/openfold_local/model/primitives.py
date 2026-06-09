@@ -60,6 +60,7 @@ from src.utils.openfold_local.utils.tensor_utils import (
     flatten_final_dims,
     permute_final_dims,
 )
+from src.utils.model.profiling import odesign_record_function
 
 DEFAULT_LMA_Q_CHUNK_SIZE = 1024
 DEFAULT_LMA_KV_CHUNK_SIZE = 4096
@@ -563,7 +564,10 @@ class Attention(nn.Module):
             biases = []
 
         # DeepSpeed attention kernel applies scaling internally
-        q, k, v = self._prep_qkv(q_x, kv_x, apply_scale=not use_deepspeed_evo_attention)
+        with odesign_record_function(self, "odesign.openfold_attention.prep_qkv"):
+            q, k, v = self._prep_qkv(
+                q_x, kv_x, apply_scale=not use_deepspeed_evo_attention
+            )
 
         if is_fp16_enabled():
             use_memory_efficient_kernel = False
@@ -576,21 +580,28 @@ class Attention(nn.Module):
                     "If use_deepspeed_evo_attention is True, you may only "
                     "provide up to two bias terms"
                 )
-            o = _deepspeed_evo_attn(q, k, v, biases)
+            with odesign_record_function(
+                self, "odesign.openfold_attention.deepspeed_evo"
+            ):
+                o = _deepspeed_evo_attn(q, k, v, biases)
         elif use_lma:
             biases = [
                 b.expand(b.shape[:-2] + (q_x.shape[-2],) + (kv_x.shape[-2],))
                 for b in biases
             ]
-            o = _lma(q, k, v, biases, lma_q_chunk_size, lma_kv_chunk_size)
-            o = o.transpose(-2, -3)
+            with odesign_record_function(self, "odesign.openfold_attention.lma"):
+                o = _lma(q, k, v, biases, lma_q_chunk_size, lma_kv_chunk_size)
+                o = o.transpose(-2, -3)
         elif use_flash:
-            o = _flash_attn(q, k, v, flash_mask)
+            with odesign_record_function(self, "odesign.openfold_attention.flash"):
+                o = _flash_attn(q, k, v, flash_mask)
         else:
-            o = _attention(q, k, v, biases)
-            o = o.transpose(-2, -3)
+            with odesign_record_function(self, "odesign.openfold_attention.stock"):
+                o = _attention(q, k, v, biases)
+                o = o.transpose(-2, -3)
 
-        o = self._wrap_up(o, q_x)
+        with odesign_record_function(self, "odesign.openfold_attention.wrap_up"):
+            o = self._wrap_up(o, q_x)
 
         return o
 

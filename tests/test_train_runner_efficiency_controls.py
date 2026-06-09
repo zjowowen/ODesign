@@ -1,5 +1,6 @@
 import unittest
 import types
+import tempfile
 from unittest import mock
 
 import torch
@@ -163,6 +164,7 @@ class TrainRunnerEfficiencyControlTests(unittest.TestCase):
         runner.profile_stage_cuda_peaks = True
         runner.profile_modules = True
         runner.profile_module_backward = False
+        runner.profile_pairformer_detail = True
         runner.device = torch.device("cpu")
         mocked_open = mock.mock_open()
         runner.profile_jsonl_path.open = mocked_open
@@ -175,6 +177,64 @@ class TrainRunnerEfficiencyControlTests(unittest.TestCase):
         self.assertIn('"profile_modules": true', written)
         self.assertIn('"profile_module_backward": false', written)
         self.assertIn('"profile_stage_cuda_peaks": true', written)
+        self.assertIn('"profile_pairformer_detail": true', written)
+
+    def test_pairformer_detail_setup_marks_model_modules(self) -> None:
+        runner = mock.Mock()
+        runner.profile_pairformer_detail = True
+        runner.model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.ReLU())
+        runner._profile_model = lambda: runner.model
+
+        TrainRunner._profile_setup_pairformer_detail_profiling(runner)
+
+        for module in runner.model.modules():
+            self.assertIs(module._odesign_profile_pairformer_detail, True)
+
+    def test_torch_profiler_context_disabled_is_noop(self) -> None:
+        runner = mock.Mock()
+        runner.torch_profiler_enabled = False
+
+        with TrainRunner._profile_torch_profiler_context(runner) as profiler:
+            self.assertIsNone(profiler)
+
+    def test_torch_profiler_context_uses_trace_dir(self) -> None:
+        runner = mock.Mock()
+        runner.torch_profiler_enabled = True
+        runner.torch_profiler_wait = 1
+        runner.torch_profiler_warmup = 1
+        runner.torch_profiler_active = 2
+        runner.torch_profiler_repeat = 1
+        runner.device = torch.device("cpu")
+        runner._profile_env_bool = TrainRunner._profile_env_bool
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner.torch_profiler_dir = tmpdir
+            with (
+                mock.patch.object(
+                    torch.profiler, "tensorboard_trace_handler", return_value="handler"
+                ) as trace_handler,
+                mock.patch.object(torch.profiler, "profile", return_value="profile_ctx")
+                as profile,
+            ):
+                context = TrainRunner._profile_torch_profiler_context(runner)
+
+        self.assertEqual(context, "profile_ctx")
+        trace_path = trace_handler.call_args.args[0]
+        self.assertTrue(trace_path.endswith("rank00"))
+        kwargs = profile.call_args.kwargs
+        self.assertEqual(kwargs["on_trace_ready"], "handler")
+        self.assertIs(kwargs["record_shapes"], True)
+        self.assertIs(kwargs["profile_memory"], True)
+        self.assertIs(kwargs["with_stack"], False)
+        self.assertIs(kwargs["with_modules"], True)
+
+    def test_torch_profiler_step_calls_active_profiler(self) -> None:
+        runner = mock.Mock()
+        runner._torch_profiler = mock.Mock()
+
+        TrainRunner._profile_torch_profiler_step(runner)
+
+        runner._torch_profiler.step.assert_called_once_with()
 
 if __name__ == "__main__":
     unittest.main()

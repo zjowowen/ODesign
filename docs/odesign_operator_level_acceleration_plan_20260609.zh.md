@@ -129,6 +129,38 @@ torch.profiler.profile(
 )
 ```
 
+已实现的开关：
+
+| env | 默认 | 作用 |
+| --- | --- | --- |
+| `ODESIGN_PROFILE_PAIRFORMER_DETAIL` | `0` | 递归打开 Pairformer/MSA/openfold-local 子模块的 `record_function` ranges |
+| `ODESIGN_TORCH_PROFILER_DIR` | empty | 非空时启用 PyTorch profiler，并把 TensorBoard trace 写到 `${DIR}/rankXX/` |
+| `ODESIGN_TORCH_PROFILER_ALL_RANKS` | `0` | 默认只 profile rank0；设为 `1` 时所有 rank 都写 trace |
+| `ODESIGN_TORCH_PROFILER_WAIT` | `1` | profiler schedule wait steps |
+| `ODESIGN_TORCH_PROFILER_WARMUP` | `1` | profiler schedule warmup steps |
+| `ODESIGN_TORCH_PROFILER_ACTIVE` | `2` | profiler schedule active steps |
+| `ODESIGN_TORCH_PROFILER_REPEAT` | `1` | profiler schedule repeat count |
+| `ODESIGN_TORCH_PROFILER_RECORD_SHAPES` | `true` | 是否记录 tensor shapes |
+| `ODESIGN_TORCH_PROFILER_PROFILE_MEMORY` | `true` | 是否记录 profiler memory |
+| `ODESIGN_TORCH_PROFILER_WITH_STACK` | `false` | 是否记录 Python stack；默认关闭以控制 trace 体积 |
+| `ODESIGN_TORCH_PROFILER_WITH_MODULES` | `true` | 是否记录 module 信息 |
+
+这些开关默认都不改变训练路径。只有显式设置 `ODESIGN_PROFILE_PAIRFORMER_DETAIL=1` 或 `ODESIGN_TORCH_PROFILER_DIR` 时才增加 profiling 行为。
+
+建议 2GPU trace run 的关键 env：
+
+```bash
+export ODESIGN_PROFILE_PAIRFORMER_DETAIL=1
+export ODESIGN_TORCH_PROFILER_DIR="${RECORD_DIR}/torch_profiler"
+export ODESIGN_TORCH_PROFILER_ALL_RANKS=0
+export ODESIGN_TORCH_PROFILER_WAIT=1
+export ODESIGN_TORCH_PROFILER_WARMUP=1
+export ODESIGN_TORCH_PROFILER_ACTIVE=2
+export ODESIGN_TORCH_PROFILER_REPEAT=1
+```
+
+如果复用 `.cluster_operator/run_efficiency_profile_e1_2gpu_0608.sh`，这些 env 可以在调用脚本前导出；脚本会把 env 传给 `scripts/train.py`，不需要改训练 override。
+
 运行合同：
 
 | 项目 | 设置 |
@@ -141,6 +173,54 @@ torch.profiler.profile(
 | 成功条件 | trace 写出、无 OOM、无 profiler warning 破坏训练、能定位 Pairformer 子阶段和 top CUDA kernels |
 
 本阶段不 claim 速度提升，只 claim attribution。
+
+## 2026-06-09 实现和 smoke 验证
+
+已实现：
+
+- `src/utils/model/profiling.py`
+  - `set_odesign_profile_detail_enabled()` 递归设置 detail flag。
+  - `odesign_record_function()` 在 detail flag 打开时进入 `torch.autograd.profiler.record_function()`。
+- `src/utils/train/train_runner.py`
+  - 新增 `ODESIGN_PROFILE_PAIRFORMER_DETAIL`。
+  - 新增 `ODESIGN_TORCH_PROFILER_DIR` 和 schedule/env 控制。
+  - 每个 microbatch 结束后调用 `profiler.step()`。
+  - profiling JSONL 写出 `profile_pairformer_detail` 和 `torch_profiler_enabled`。
+- Pairformer/MSA/openfold-local 子路径已添加 ranges：
+  - `odesign.pairformer_block.tri_mul_out`
+  - `odesign.pairformer_block.tri_mul_in`
+  - `odesign.pairformer_block.tri_att_start`
+  - `odesign.pairformer_block.tri_att_end`
+  - `odesign.pairformer_block.pair_transition`
+  - `odesign.pairformer_block.attention_pair_bias`
+  - `odesign.pairformer_block.single_transition`
+  - `odesign.msa_block.outer_product_mean`
+  - `odesign.msa_block.msa_stack`
+  - `odesign.msa_block.pair_stack`
+  - `odesign.triangle_attention.*`
+  - `odesign.triangle_multiplication.*`
+  - `odesign.outer_product_mean.*`
+  - `odesign.openfold_attention.prep_qkv`
+  - `odesign.openfold_attention.deepspeed_evo`
+  - `odesign.openfold_attention.stock`
+  - `odesign.openfold_attention.wrap_up`
+  - `odesign.transition.*`
+
+已验证：
+
+| gate | evidence |
+| --- | --- |
+| local py_compile | operator profiling touched files pass |
+| remote py_compile | H200 `odesign` env pass |
+| remote unit tests | `test_odesign_operator_profiling.py`: `Ran 4 tests OK`; `test_train_runner_efficiency_controls.py`: `Ran 12 tests OK`; `test_odesign_module_profiling.py`: `Ran 2 tests OK` |
+| profiler context smoke | `.cluster_operator/operator_profiler_context_smoke_0609/rank00/*.pt.trace.json` 写出 1 个 trace |
+| Pairformer range smoke | `.cluster_operator/operator_pairformer_range_smoke_0609/rank00/*.pt.trace.json` 写出 1 个 trace，trace 中包含 `odesign.pairformer_block.tri_mul_out`、`odesign.pairformer_block.tri_att_start`、`odesign.openfold_attention.stock` |
+
+未验证：
+
+- 尚未跑真实 2GPU ODesign 训练 trace。
+- 尚未生成 Pairformer/MSA top CUDA kernel 表。
+- 尚未设计或验证任何加速候选。
 
 ## Phase B：等价优化候选
 
