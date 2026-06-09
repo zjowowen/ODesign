@@ -75,6 +75,9 @@ class TrainRunner(object):
             self.profile_all_ranks or DIST_WRAPPER.rank == 0
         )
         self.profile_sync_cuda = os.environ.get("ODESIGN_PROFILE_SYNC_CUDA", "1") != "0"
+        self.profile_stage_cuda_peaks = (
+            os.environ.get("ODESIGN_PROFILE_STAGE_CUDA_PEAKS", "0") == "1"
+        )
         self.empty_cache_policy = self._normalize_empty_cache_policy(
             os.environ.get("ODESIGN_EMPTY_CACHE_POLICY")
         )
@@ -128,6 +131,48 @@ class TrainRunner(object):
         ):
             torch.cuda.synchronize(self.device)
         return time.perf_counter()
+
+    def _profile_cuda_stage_enabled(self, profile_record: dict | None) -> bool:
+        return (
+            profile_record is not None
+            and self.profile_enabled
+            and self.profile_stage_cuda_peaks
+            and torch.cuda.is_available()
+            and self.device.type == "cuda"
+        )
+
+    def _profile_cuda_stage_begin(
+        self, profile_record: dict | None, stage_name: str
+    ) -> None:
+        if not self._profile_cuda_stage_enabled(profile_record):
+            return
+        torch.cuda.synchronize(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        profile_record[f"{stage_name}_gpu_mem_start_allocated_mib"] = (
+            torch.cuda.memory_allocated(self.device) / 1024**2
+        )
+        profile_record[f"{stage_name}_gpu_mem_start_reserved_mib"] = (
+            torch.cuda.memory_reserved(self.device) / 1024**2
+        )
+
+    def _profile_cuda_stage_end(
+        self, profile_record: dict | None, stage_name: str
+    ) -> None:
+        if not self._profile_cuda_stage_enabled(profile_record):
+            return
+        torch.cuda.synchronize(self.device)
+        profile_record[f"{stage_name}_gpu_mem_end_allocated_mib"] = (
+            torch.cuda.memory_allocated(self.device) / 1024**2
+        )
+        profile_record[f"{stage_name}_gpu_mem_end_reserved_mib"] = (
+            torch.cuda.memory_reserved(self.device) / 1024**2
+        )
+        profile_record[f"{stage_name}_gpu_mem_peak_allocated_mib"] = (
+            torch.cuda.max_memory_allocated(self.device) / 1024**2
+        )
+        profile_record[f"{stage_name}_gpu_mem_peak_reserved_mib"] = (
+            torch.cuda.max_memory_reserved(self.device) / 1024**2
+        )
 
     @staticmethod
     def _profile_to_int(value):
@@ -208,6 +253,7 @@ class TrainRunner(object):
         record["step"] = int(self.step)
         record["global_step"] = int(self.global_step)
         record["timestamp"] = time.time()
+        record["profile_stage_cuda_peaks"] = bool(self.profile_stage_cuda_peaks)
         if torch.cuda.is_available() and self.device.type == "cuda":
             record["gpu_mem_allocated_mib"] = (
                 torch.cuda.memory_allocated(self.device) / 1024**2
@@ -215,11 +261,31 @@ class TrainRunner(object):
             record["gpu_mem_reserved_mib"] = (
                 torch.cuda.memory_reserved(self.device) / 1024**2
             )
+            stage_peak_allocated = max(
+                (
+                    value
+                    for key, value in record.items()
+                    if key.endswith("_gpu_mem_peak_allocated_mib")
+                ),
+                default=None,
+            )
+            stage_peak_reserved = max(
+                (
+                    value
+                    for key, value in record.items()
+                    if key.endswith("_gpu_mem_peak_reserved_mib")
+                ),
+                default=None,
+            )
             record["gpu_mem_max_allocated_mib"] = (
-                torch.cuda.max_memory_allocated(self.device) / 1024**2
+                stage_peak_allocated
+                if stage_peak_allocated is not None
+                else torch.cuda.max_memory_allocated(self.device) / 1024**2
             )
             record["gpu_mem_max_reserved_mib"] = (
-                torch.cuda.max_memory_reserved(self.device) / 1024**2
+                stage_peak_reserved
+                if stage_peak_reserved is not None
+                else torch.cuda.max_memory_reserved(self.device) / 1024**2
             )
         with self.profile_jsonl_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -452,12 +518,16 @@ class TrainRunner(object):
         train_step_start = self._profile_now() if profile_record is not None else None
         with enable_amp:
             forward_start = self._profile_now() if profile_record is not None else None
+            self._profile_cuda_stage_begin(profile_record, "forward")
             pred_output, ground_truth, loss_input = self.model_forward(batch, mode="train")
             if profile_record is not None:
+                self._profile_cuda_stage_end(profile_record, "forward")
                 profile_record["forward_sec"] = self._profile_now() - forward_start
             loss_start = self._profile_now() if profile_record is not None else None
+            self._profile_cuda_stage_begin(profile_record, "loss")
             loss, loss_dict = self.get_loss(loss_input, pred_output, ground_truth, mode="train")
             if profile_record is not None:
+                self._profile_cuda_stage_end(profile_record, "loss")
                 profile_record["loss_sec"] = self._profile_now() - loss_start
                 profile_record["loss"] = self._profile_to_float(loss)
                 profile_record["loss_components"] = {
@@ -471,8 +541,10 @@ class TrainRunner(object):
                 self.print(f"Skip iteration with NaN loss: {self.step} steps")
                 loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
         backward_start = self._profile_now() if profile_record is not None else None
+        self._profile_cuda_stage_begin(profile_record, "backward")
         scaler.scale(loss / self.iters_to_accumulate).backward()
         if profile_record is not None:
+            self._profile_cuda_stage_end(profile_record, "backward")
             profile_record["backward_sec"] = self._profile_now() - backward_start
 
         did_optimizer_update = False
@@ -482,6 +554,7 @@ class TrainRunner(object):
                 f"self.step {self.step}, self.iters_to_accumulate: {self.iters_to_accumulate}"
             )
             optimizer_start = self._profile_now() if profile_record is not None else None
+            self._profile_cuda_stage_begin(profile_record, "optimizer")
             # Unscales the gradients of optimizer's assigned parameters in-place
             scaler.unscale_(self.optimizer)
             # Do grad clip only
@@ -492,6 +565,7 @@ class TrainRunner(object):
             self.lr_scheduler.step()
             did_optimizer_update = True
             if profile_record is not None:
+                self._profile_cuda_stage_end(profile_record, "optimizer")
                 profile_record["optimizer_sec"] = self._profile_now() - optimizer_start
                 profile_record["optimizer_update"] = True
         elif profile_record is not None:
@@ -506,9 +580,11 @@ class TrainRunner(object):
             self.empty_cache_policy, did_optimizer_update
         )
         empty_cache_start = self._profile_now() if profile_record is not None else None
+        self._profile_cuda_stage_begin(profile_record, "empty_cache")
         if should_empty_cache:
             torch.cuda.empty_cache()
         if profile_record is not None:
+            self._profile_cuda_stage_end(profile_record, "empty_cache")
             profile_record["empty_cache_policy"] = self.empty_cache_policy
             profile_record["empty_cache_called"] = bool(should_empty_cache)
             profile_record["empty_cache_sec"] = self._profile_now() - empty_cache_start
@@ -577,8 +653,10 @@ class TrainRunner(object):
                 step_need_save &= is_update_step
 
                 to_device_start = self._profile_now() if profile_record is not None else None
+                self._profile_cuda_stage_begin(profile_record, "to_device")
                 batch = to_device(batch, self.device)
                 if profile_record is not None:
+                    self._profile_cuda_stage_end(profile_record, "to_device")
                     profile_record["to_device_sec"] = self._profile_now() - to_device_start
                     profile_record["is_update_step"] = bool(is_update_step)
                     profile_record["will_save_checkpoint"] = bool(step_need_save or is_last_step)
