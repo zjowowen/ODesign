@@ -23,6 +23,190 @@ from src.api.model_interface import (
     GroundTruth,
 )
 
+
+def _is_batched_structure_tensor(coordinate: torch.Tensor) -> bool:
+    return coordinate.dim() == 3 and coordinate.size(-1) == 3
+
+
+_BATCH_LIST_FIELDS = {"atom_perm_list", "masked_asym_ids"}
+_ATOM_FIRST_DIM_FIELDS = {
+    "atom_padding_mask",
+    "atom_to_token_idx",
+    "atom_to_tokatom_idx",
+    "chain_1_mask",
+    "chain_2_mask",
+    "coordinate_mask",
+    "distogram_rep_atom_mask",
+    "entity_mol_id",
+    "is_condition_atom",
+    "is_dna",
+    "is_ligand",
+    "is_protein",
+    "is_rna",
+    "modified_res_mask",
+    "mol_atom_index",
+    "mol_id",
+    "pae_rep_atom_mask",
+    "plddt_m_rep_atom_mask",
+    "ref_atom_name_chars",
+    "ref_charge",
+    "ref_element",
+    "ref_mask",
+    "ref_pos",
+    "ref_space_uid",
+}
+_ATOM_LAST_DIM_FIELDS = {
+    "interested_ligand_mask",
+    "pocket_mask",
+}
+_ATOM_PAIR_FIELDS = {
+    "bond_mask",
+    "distance",
+    "distance_mask",
+    "lddt_mask",
+    "ligand_bond_mask",
+}
+
+
+def _data_object_items(data):
+    if isinstance(data, dict):
+        return list(data.items())
+    if hasattr(data, "items"):
+        return list(data.items())
+    attrs_fields = getattr(data.__class__, "__attrs_attrs__", None)
+    if attrs_fields is not None:
+        return [(field.name, getattr(data, field.name)) for field in attrs_fields]
+    return list(vars(data).items())
+
+
+def _make_data_object_like(data, values: dict):
+    if isinstance(data, dict):
+        return values
+    return data.__class__(**values)
+
+
+def _is_collated_batch_list_field(key: str, value: list, batch_size: int) -> bool:
+    if key not in _BATCH_LIST_FIELDS or len(value) != batch_size:
+        return False
+    if key == "atom_perm_list":
+        return all(
+            isinstance(item, list) and (not item or isinstance(item[0], list))
+            for item in value
+        )
+    if key == "masked_asym_ids":
+        return all(item is None or isinstance(item, list) for item in value)
+    return False
+
+
+def _slice_batch_item(data, batch_idx: int, batch_size: int):
+    sliced_data = {}
+    for key, value in _data_object_items(data):
+        if (
+            isinstance(value, torch.Tensor)
+            and value.dim() > 0
+            and value.size(0) == batch_size
+        ):
+            sliced_data[key] = value[batch_idx]
+        elif isinstance(value, list) and _is_collated_batch_list_field(
+            key, value, batch_size
+        ):
+            sliced_data[key] = value[batch_idx]
+        else:
+            sliced_data[key] = value
+
+    return _make_data_object_like(data, sliced_data)
+
+
+def _real_atom_len_from_coordinate_mask(coordinate_mask: torch.Tensor) -> int:
+    valid_positions = torch.nonzero(coordinate_mask.bool(), as_tuple=False).flatten()
+    if valid_positions.numel() == 0:
+        return 0
+    return int(valid_positions[-1].item()) + 1
+
+
+def _crop_atom_prefix_value(key: str, value, real_atom_len: int):
+    if key == "atom_perm_list" and isinstance(value, list):
+        return value[:real_atom_len]
+    if not isinstance(value, torch.Tensor) or value.dim() == 0:
+        return value
+    if key == "coordinate":
+        return value[..., :real_atom_len, :]
+    if key in _ATOM_PAIR_FIELDS:
+        return value[..., :real_atom_len, :real_atom_len]
+    if key in _ATOM_LAST_DIM_FIELDS:
+        return value[..., :real_atom_len]
+    if key in _ATOM_FIRST_DIM_FIELDS:
+        return value[:real_atom_len, ...]
+    return value
+
+
+def _crop_atom_prefix(data, real_atom_len: int):
+    return _make_data_object_like(
+        data,
+        {
+            key: _crop_atom_prefix_value(key, value, real_atom_len)
+            for key, value in _data_object_items(data)
+        },
+    )
+
+
+def _restore_atom_prefix_value(key: str, padded_value, real_value, real_atom_len: int):
+    if real_value is None:
+        return padded_value
+    if padded_value is None:
+        return real_value
+    if not isinstance(padded_value, torch.Tensor) or not isinstance(
+        real_value, torch.Tensor
+    ):
+        return padded_value
+    if key == "coordinate":
+        restored = padded_value.clone()
+        restored[..., :real_atom_len, :] = real_value
+        return restored
+    if key in _ATOM_PAIR_FIELDS:
+        restored = padded_value.clone()
+        restored[..., :real_atom_len, :real_atom_len] = real_value
+        return restored
+    if key in _ATOM_FIRST_DIM_FIELDS:
+        restored = padded_value.clone()
+        restored[:real_atom_len, ...] = real_value
+        return restored
+    return padded_value
+
+
+def _restore_atom_prefix_output(
+    padded_output: ODesignOutput,
+    real_output: ODesignOutput,
+    real_atom_len: int,
+) -> ODesignOutput:
+    restored_data = {}
+    for key, padded_value in _data_object_items(padded_output):
+        restored_data[key] = _restore_atom_prefix_value(
+            key=key,
+            padded_value=padded_value,
+            real_value=getattr(real_output, key),
+            real_atom_len=real_atom_len,
+        )
+    return ODesignOutput(**restored_data)
+
+
+def _stack_odesign_outputs(outputs: list[ODesignOutput]) -> ODesignOutput:
+    if not outputs:
+        raise ValueError("Cannot stack an empty list of ODesignOutput objects.")
+
+    stacked_data = {}
+    for key, _ in _data_object_items(outputs[0]):
+        values = [getattr(output, key) for output in outputs]
+        if all(value is None for value in values):
+            stacked_data[key] = None
+        elif all(isinstance(value, torch.Tensor) for value in values):
+            stacked_data[key] = torch.stack(values, dim=0)
+        else:
+            stacked_data[key] = values
+
+    return ODesignOutput(**stacked_data)
+
+
 class SymmetricPermutation(object):
     """
     A symmetric permutation class for chain and atom permutations.
@@ -141,6 +325,55 @@ class SymmetricPermutation(object):
         assert model_output.coordinate.size(-2) == ground_truth.coordinate.size(
             -2
         ), "Cannot perform per-sample permutation on predicted structures if the label structure has more atoms."
+
+        if ground_truth.coordinate.dim() == 3:
+            assert (
+                stage == "train"
+            ), "Batched diffusion sample permutation is only supported during training."
+            batch_size = ground_truth.coordinate.size(0)
+            batched_log_dict = {}
+            batch_outputs = []
+
+            for batch_idx in range(batch_size):
+                real_atom_len = _real_atom_len_from_coordinate_mask(
+                    ground_truth.coordinate_mask[batch_idx]
+                )
+                padded_batch_output = _slice_batch_item(
+                    model_output, batch_idx, batch_size
+                )
+                batch_output, batch_log_dict, _, _ = (
+                    self.permute_diffusion_sample_to_match_label(
+                        input_data=_crop_atom_prefix(
+                            _slice_batch_item(input_data, batch_idx, batch_size),
+                            real_atom_len,
+                        ),
+                        model_output=_crop_atom_prefix(
+                            padded_batch_output,
+                            real_atom_len,
+                        ),
+                        ground_truth=_crop_atom_prefix(
+                            _slice_batch_item(ground_truth, batch_idx, batch_size),
+                            real_atom_len,
+                        ),
+                        stage=stage,
+                        permute_by_pocket=permute_by_pocket,
+                    )
+                )
+                batch_outputs.append(
+                    _restore_atom_prefix_output(
+                        padded_output=padded_batch_output,
+                        real_output=batch_output,
+                        real_atom_len=real_atom_len,
+                    )
+                )
+                batched_log_dict.update(
+                    {
+                        f"batch{batch_idx}/{key}": value
+                        for key, value in batch_log_dict.items()
+                    }
+                )
+
+            return _stack_odesign_outputs(batch_outputs), batched_log_dict, None, None
 
         log_dict = {}
         permute_pred_indices, permute_label_indices = [], []

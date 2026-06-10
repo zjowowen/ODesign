@@ -212,6 +212,8 @@ class PairFormerInput(DictAccessMixin):
 
     # Optional fields
     is_cyclic_token: FlagType | None = None
+    token_padding_mask: MaskType | None = None
+    atom_padding_mask: MaskType | None = None
 
     @classmethod
     def from_feature_data(cls, input_data: OFeatureData) -> "PairFormerInput":
@@ -381,6 +383,8 @@ class DiffusionInput(DictAccessMixin):
     is_condition_atom: MaskType
 
     is_cyclic_token: FlagType | None = None
+    token_padding_mask: MaskType | None = None
+    atom_padding_mask: MaskType | None = None
     cyclic_mode: str = "full"
     cycle_bonds: list = []
     
@@ -599,6 +603,7 @@ class LossInput(DictAccessMixin):
     is_condition_atom: MaskType
     resolution: FeatureType 
     distogram_rep_atom_mask: MaskType | None
+    atom_padding_mask: MaskType | None = None
 
     @classmethod
     def from_feature_data(cls, input_data: OFeatureData) -> "PermutationInput":

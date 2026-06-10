@@ -1,5 +1,6 @@
 num_dl_workers: 0
 epoch_size: 10000
+train_batch_size: 1
 
 train_crop_size: ${exp.train_crop_size}
 test_max_n_token: -1

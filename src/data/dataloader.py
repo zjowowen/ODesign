@@ -22,6 +22,7 @@ from ml_collections.config_dict import ConfigDict
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, Sampler
 
 from src.data.dataset import get_datasets, InferenceDataset
+from src.utils.model.padded_collate import collate_fn_odesign_padded
 from src.utils.model.torch_utils import collate_fn_first, collate_fn_identity
 from src.utils.train.distributed import DIST_WRAPPER
 
@@ -318,6 +319,10 @@ def get_dataloaders(
 
     """
     train_dataset, test_datasets = get_datasets(configs, error_dir)
+    train_batch_size = int(configs.data.get("train_batch_size", 1))
+    train_collate_fn = (
+        collate_fn_odesign_padded if train_batch_size > 1 else collate_fn_first
+    )
     if world_size > 1:
         train_sampler = DistributedWeightedSampler(
             train_dataset,
@@ -328,10 +333,10 @@ def get_dataloaders(
         )
         train_dl = DistributedDataLoader(
             dataset=train_dataset,
-            batch_size=1,
+            batch_size=train_batch_size,
             shuffle=False,
             num_workers=configs.data.num_dl_workers,
-            collate_fn=collate_fn_first,
+            collate_fn=train_collate_fn,
             sampler=train_sampler,
         )
     else:
@@ -344,10 +349,10 @@ def get_dataloaders(
         )
         train_dl = IterDataLoader(
             dataset=train_dataset,
-            batch_size=1,
+            batch_size=train_batch_size,
             shuffle=False,
             num_workers=configs.data.num_dl_workers,
-            collate_fn=collate_fn_first,
+            collate_fn=train_collate_fn,
             sampler=train_sampler,
         )
 

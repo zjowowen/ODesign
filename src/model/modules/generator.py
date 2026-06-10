@@ -58,7 +58,20 @@ from src.model.modules.schedulers import (
     InferenceNoiseScheduler,
     InferenceNoiseEDMScheduler
 )
-        
+
+
+def _diffusion_batch_prefix(coordinate: torch.Tensor) -> tuple[int, ...]:
+    return tuple(coordinate.shape[:-2])
+
+
+def _diffusion_sample_shape(coordinate: torch.Tensor, n_sample: int) -> tuple[int, ...]:
+    return (
+        *_diffusion_batch_prefix(coordinate),
+        n_sample,
+        coordinate.size(-2),
+        coordinate.size(-1),
+    )
+
 
 @register_license('odesign2025')
 def sample_diffusion(
@@ -408,10 +421,13 @@ def sample_diffusion_training(
     """
     device = ground_truth.coordinate.device
     dtype = ground_truth.coordinate.dtype
+    batch_prefix = _diffusion_batch_prefix(ground_truth.coordinate)
+    N_atom = ground_truth.coordinate.size(-2)
+    sample_shape = _diffusion_sample_shape(ground_truth.coordinate, N_sample)
 
     # Step 1: Apply random SE(3) augmentation to ground truth coordinates
     # This makes the model SE(3) equivariant (invariant to global frame)
-    # Shape: [N_sample, N_atom, 3]
+    # Shape: [*batch_prefix, N_sample, N_atom, 3]
     x_gt_augment, trans, rot, x_center = centre_random_augmentation(
         x_input_coords=ground_truth.coordinate,
         N_sample=N_sample,
@@ -424,21 +440,21 @@ def sample_diffusion_training(
     # Typically uses log-normal or EDM distribution
     coord_noise_scheduler = noise_schedulers['coordinate']
 
-    # Shape: [N_sample]
+    # Shape: [*batch_prefix, N_sample]
     sigma = coord_noise_scheduler.sample_noise_level(
-        size=(N_sample,), device=device
+        size=(*batch_prefix, N_sample), device=device
     ).to(dtype)
 
     # Step 3: Create conditioning mask for atoms that should remain fixed
     # Conditioned atoms will not receive noise and remain at ground truth
-    # Shape: [N_sample, N_atom]
+    # Shape: [*batch_prefix, N_sample, N_atom]
     condition_mask = torch.logical_and(
         ground_truth.coordinate_mask, input_data.is_condition_atom
-    ).unsqueeze(dim=0).expand(N_sample, -1)
+    ).unsqueeze(dim=-2).expand(*batch_prefix, N_sample, N_atom)
 
     # Step 4: Add Gaussian noise to coordinates based on sampled noise levels
     # Conditioned atoms are NOT noised (remain at ground truth positions)
-    # Shape: [N_sample, N_atom, 3]
+    # Shape: [*batch_prefix, N_sample, N_atom, 3]
     x_noisy = coord_noise_scheduler.add_noise_with_condition(
         x_gt=x_gt_augment,
         sigma=sigma,
@@ -486,7 +502,7 @@ def sample_diffusion_training(
     
     # Step 6: Compute final denoised coordinates
     # Conditioned atoms are kept exactly at ground truth positions
-    # Shape: [N_sample, N_atom, 3]
+    # Shape: [*batch_prefix, N_sample, N_atom, 3]
     x_denoised = coord_noise_scheduler.denoise_with_conditon(
         x_noisy=x_noisy,
         x_update=x_update,
@@ -499,7 +515,10 @@ def sample_diffusion_training(
     x_denoised = reverse_centre_random_augmentation(x_denoised, trans, rot, x_center)
     
     # Step 8: Verification - ensure conditioned atoms match ground truth exactly
-    check_condition_atom_coords(x_denoised, ground_truth.coordinate, condition_mask)
+    x_gt = ground_truth.coordinate.unsqueeze(dim=-3).expand(sample_shape)
+    if condition_mask.any():
+        if (x_denoised[condition_mask] - x_gt[condition_mask]).abs().max() > 5e-3:
+            raise ValueError("Condition atom coords set error")
     
     # Return denoised coordinates and noise levels
     # Noise levels (sigma) are used for loss weighting in training

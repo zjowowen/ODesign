@@ -22,6 +22,7 @@ import torch.nn as nn
 from src.utils.openfold_local.model.primitives import Attention, LayerNorm, Linear
 from src.utils.openfold_local.utils.chunk_utils import chunk_layer
 from src.utils.openfold_local.utils.tensor_utils import permute_final_dims
+from src.utils.model.profiling import odesign_record_function
 
 
 class TriangleAttention(nn.Module):
@@ -110,13 +111,16 @@ class TriangleAttention(nn.Module):
             mask = mask.transpose(-1, -2)
 
         # [*, I, J, C_in]
-        x = self.layer_norm(x)
+        with odesign_record_function(self, "odesign.triangle_attention.layer_norm"):
+            x = self.layer_norm(x)
 
         # [*, I, 1, 1, J]
-        mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
+        with odesign_record_function(self, "odesign.triangle_attention.mask_bias"):
+            mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
 
         # [*, H, I, J]
-        triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))
+        with odesign_record_function(self, "odesign.triangle_attention.triangle_bias"):
+            triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))
 
         # [*, 1, H, I, J]
         triangle_bias = triangle_bias.unsqueeze(-4)
@@ -124,24 +128,26 @@ class TriangleAttention(nn.Module):
         biases = [mask_bias, triangle_bias]
 
         if chunk_size is not None:
-            x = self._chunk(
-                x,
-                biases,
-                chunk_size,
-                use_memory_efficient_kernel=use_memory_efficient_kernel,
-                use_deepspeed_evo_attention=use_deepspeed_evo_attention,
-                use_lma=use_lma,
-                inplace_safe=inplace_safe,
-            )
+            with odesign_record_function(self, "odesign.triangle_attention.mha_chunk"):
+                x = self._chunk(
+                    x,
+                    biases,
+                    chunk_size,
+                    use_memory_efficient_kernel=use_memory_efficient_kernel,
+                    use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                    use_lma=use_lma,
+                    inplace_safe=inplace_safe,
+                )
         else:
-            x = self.mha(
-                q_x=x,
-                kv_x=x,
-                biases=biases,
-                use_memory_efficient_kernel=use_memory_efficient_kernel,
-                use_deepspeed_evo_attention=use_deepspeed_evo_attention,
-                use_lma=use_lma,
-            )
+            with odesign_record_function(self, "odesign.triangle_attention.mha"):
+                x = self.mha(
+                    q_x=x,
+                    kv_x=x,
+                    biases=biases,
+                    use_memory_efficient_kernel=use_memory_efficient_kernel,
+                    use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                    use_lma=use_lma,
+                )
 
         if not self.starting:
             x = x.transpose(-2, -3)

@@ -32,6 +32,7 @@ import torch.nn as nn
 from src.utils.openfold_local.model.primitives import LayerNorm, Linear
 from src.utils.openfold_local.utils.precision_utils import is_fp16_enabled
 from src.utils.openfold_local.utils.tensor_utils import add, permute_final_dims
+from src.utils.model.profiling import odesign_record_function
 
 
 class BaseTriangleMultiplicativeUpdate(nn.Module, ABC):
@@ -434,13 +435,14 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
 
         mask = mask.unsqueeze(-1)
 
-        z = self.layer_norm_in(z)
-        a = mask
-        a = a * self.sigmoid(self.linear_a_g(z))
-        a = a * self.linear_a_p(z)
-        b = mask
-        b = b * self.sigmoid(self.linear_b_g(z))
-        b = b * self.linear_b_p(z)
+        with odesign_record_function(self, "odesign.triangle_multiplication.projections"):
+            z = self.layer_norm_in(z)
+            a = mask
+            a = a * self.sigmoid(self.linear_a_g(z))
+            a = a * self.linear_a_p(z)
+            b = mask
+            b = b * self.sigmoid(self.linear_b_g(z))
+            b = b * self.linear_b_p(z)
 
         # Prevents overflow of torch.matmul in combine projections in
         # reduced-precision modes
@@ -452,15 +454,20 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
 
         if is_fp16_enabled():
             with torch.cuda.amp.autocast(enabled=False):
-                x = self._combine_projections(a.float(), b.float())
+                with odesign_record_function(
+                    self, "odesign.triangle_multiplication.combine"
+                ):
+                    x = self._combine_projections(a.float(), b.float())
         else:
-            x = self._combine_projections(a, b)
+            with odesign_record_function(self, "odesign.triangle_multiplication.combine"):
+                x = self._combine_projections(a, b)
 
         del a, b
-        x = self.layer_norm_out(x)
-        x = self.linear_z(x)
-        g = self.sigmoid(self.linear_g(z))
-        x = x * g
+        with odesign_record_function(self, "odesign.triangle_multiplication.output"):
+            x = self.layer_norm_out(x)
+            x = self.linear_z(x)
+            g = self.sigmoid(self.linear_g(z))
+            x = x * g
 
         return x
 
@@ -586,13 +593,16 @@ class FusedTriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
 
         mask = mask.unsqueeze(-1)
 
-        z = self.layer_norm_in(z)
-        ab = mask
-        ab = ab * self.sigmoid(self.linear_ab_g(z))
-        ab = ab * self.linear_ab_p(z)
+        with odesign_record_function(
+            self, "odesign.fused_triangle_multiplication.projections"
+        ):
+            z = self.layer_norm_in(z)
+            ab = mask
+            ab = ab * self.sigmoid(self.linear_ab_g(z))
+            ab = ab * self.linear_ab_p(z)
 
-        a = ab[..., : self.c_hidden]
-        b = ab[..., self.c_hidden :]
+            a = ab[..., : self.c_hidden]
+            b = ab[..., self.c_hidden :]
 
         # Prevents overflow of torch.matmul in combine projections in
         # reduced-precision modes
@@ -604,15 +614,22 @@ class FusedTriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
 
         if is_fp16_enabled():
             with torch.cuda.amp.autocast(enabled=False):
-                x = self._combine_projections(a.float(), b.float())
+                with odesign_record_function(
+                    self, "odesign.fused_triangle_multiplication.combine"
+                ):
+                    x = self._combine_projections(a.float(), b.float())
         else:
-            x = self._combine_projections(a, b)
+            with odesign_record_function(
+                self, "odesign.fused_triangle_multiplication.combine"
+            ):
+                x = self._combine_projections(a, b)
 
         del a, b
-        x = self.layer_norm_out(x)
-        x = self.linear_z(x)
-        g = self.sigmoid(self.linear_g(z))
-        x = x * g
+        with odesign_record_function(self, "odesign.fused_triangle_multiplication.output"):
+            x = self.layer_norm_out(x)
+            x = self.linear_z(x)
+            g = self.sigmoid(self.linear_g(z))
+            x = x * g
 
         return x
 

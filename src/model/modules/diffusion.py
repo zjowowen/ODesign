@@ -36,6 +36,19 @@ from src.api.model_interface import (
 logger = logging.getLogger(__name__)
 
 
+def _make_token_pair_mask(
+    input_data: DiffusionInput,
+    N_sample: int,
+) -> Optional[torch.Tensor]:
+    token_padding_mask = getattr(input_data, "token_padding_mask", None)
+    if token_padding_mask is None:
+        return None
+
+    valid_token_mask = ~token_padding_mask.bool()
+    token_pair_mask = valid_token_mask[..., :, None] & valid_token_mask[..., None, :]
+    return expand_at_dim(token_pair_mask, dim=-3, n=N_sample)
+
+
 class DiffusionConditioning(nn.Module):
     """
     Implements Algorithm 21 in AF3
@@ -373,6 +386,7 @@ class DiffusionModule(nn.Module):
             a=a_token.to(dtype=torch.float32),  # Upcast all inputs
             s=s_single.to(dtype=torch.float32),
             z=z_pair.to(dtype=torch.float32),
+            attn_mask=_make_token_pair_mask(input_data, N_sample=N_sample),
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
