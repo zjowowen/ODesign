@@ -1,4 +1,5 @@
 from functools import partial
+import os
 from typing import Any, Optional
 
 import torch
@@ -80,6 +81,16 @@ def _chunk_msa_rows(msa: torch.Tensor, chunk_size: int) -> list[torch.Tensor]:
         end = min(start + chunk_size, dim_size)
         chunks.append(msa.narrow(dim=-3, start=start, length=end - start))
     return chunks
+
+
+def _debug_msa_padding_check_enabled() -> bool:
+    value = os.environ.get("ODESIGN_DEBUG_MSA_PADDING_CHECK", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _assert_msa_padding_roundtrip(padded_msa: torch.Tensor, msa: torch.Tensor) -> None:
+    if not torch.equal(_slice_msa_rows(padded_msa, msa.shape[-3]), msa):
+        raise AssertionError("MSA padding roundtrip changed the real MSA rows")
 
 
 @register_license('bytedance2024')
@@ -672,7 +683,8 @@ class MSAStack(nn.Module):
             m_new = pad_at_dim(
                 m, dim=-3, pad_length=(0, self.msa_max_size - m.shape[-3]), value=0
             )
-            assert (_slice_msa_rows(m_new, m.shape[-3]) == m).all()
+            if _debug_msa_padding_check_enabled():
+                _assert_msa_padding_roundtrip(m_new, m)
             msa_pair_weighted = self.chunk_forward(
                 self.msa_pair_weighted_averaging, m_new, z, chunk_size
             )

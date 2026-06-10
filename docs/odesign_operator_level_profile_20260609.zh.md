@@ -25,6 +25,7 @@
 - `record_function` 的 `user_annotation` range 显示最重的子路径集中在 MSA stack、triangle multiplication、attention pair bias、triangle attention 和 transition。
 - 全局 top event 里有大量 `aten::copy_`、`aten::to`、`aten::_to_copy`、`aten::item`、layer norm kernel、NCCL all-reduce 和 `cudaStreamSynchronize`。这些是下一步排查 runtime/layout/sync 的候选，但还不能直接 claim 某个优化一定有效。
 - 2026-06-10 已补轻量 r2 trace 复现实验，关闭 `record_shapes/profile_memory` 且 active window 从 `2` 降到 `1`。r2 的 trace 更小，热点排序仍和 r1 一致。
+- 2026-06-10 已补 `aten::item/_local_scalar_dense/is_nonzero` 和 `aten::to/_to_copy/copy_` 专项审计，详见 `docs/odesign_operator_sync_copy_audit_20260610.zh.md`。其中 `odesign.msa_block.msa_stack` 的 42 次长同步已定位到训练分支 padding roundtrip assert，并已改为默认关闭的 debug check。
 
 直接决策：
 
@@ -286,7 +287,7 @@ r2 前排 range 和 r1 一致：
 
 建议按以下顺序继续：
 
-1. 审计 `aten::item` / `_local_scalar_dense` 来源，判断是否来自训练日志/跳坏样本/条件分支/profiler，而不是核心数学路径。
-2. 审计 `aten::to` / `_to_copy` / `copy_` 来源，优先检查 Pairformer triangle attention 的 mask/bias、transpose、contiguous、dtype 转换。
-3. 从一个低风险局部候选开始，例如 attention bias/mask materialization 或 transition gate 局部 fusion；先做 G1 单模块 allclose，再做 G2 真实 batch 单 step allclose。
-4. 数值通过后再做无 profiler speed run，比较同一训练 setting 下的 mean/p50/p90 和 peak memory。
+1. 跑 E3A：对 MSA padding assert removal 做无 PyTorch profiler 的 before/after speed gate，比较同一训练 setting 下的 mean/p50/p90 和 peak memory。
+2. 继续 E3B：对 `aten::to` / `_to_copy` / `copy_` 做细归因，优先区分参数 dtype cast、activation layout materialize、外部 loss/permutation 大 tensor copy。
+3. 若进入 copy/to 优化，先做 G1 单模块 allclose，再做 G2 真实 batch 单 step allclose。
+4. 数值通过后再做无 profiler speed run；未完成 speed gate 前不 claim 训练吞吐收益。

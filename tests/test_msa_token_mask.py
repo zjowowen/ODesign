@@ -1,9 +1,11 @@
 import torch
+from unittest import mock
 
 from src.model.modules.pairformer import (
     MSAStack,
     _add_single_embedding_to_msa,
     _apply_msa_token_mask,
+    _assert_msa_padding_roundtrip,
     _chunk_msa_rows,
     _slice_msa_rows,
 )
@@ -86,3 +88,44 @@ def test_msa_stack_inference_forward_chunks_msa_axis_with_batch_prefix() -> None
     expected_chunk_shapes = [(2, 2, 3, 4), (2, 2, 3, 4), (2, 1, 3, 4)]
     assert pair_weighted_shapes == expected_chunk_shapes
     assert transition_shapes == expected_chunk_shapes
+
+
+def test_msa_stack_train_forward_skips_padding_roundtrip_check_by_default() -> None:
+    stack = MSAStack(c_m=4, msa_chunk_size=2, msa_max_size=6)
+    stack.dropout_row = torch.nn.Identity()
+    stack.train()
+
+    def fake_chunk_forward(
+        module: torch.nn.Module,
+        m: torch.Tensor,
+        z,
+        chunk_size: int = 2048,
+    ) -> torch.Tensor:
+        return torch.zeros_like(m)
+
+    stack.chunk_forward = fake_chunk_forward
+
+    msa = torch.randn(2, 3, 5, 4)
+    pair = torch.randn(2, 5, 5, 4)
+
+    with mock.patch.object(
+        torch.Tensor,
+        "all",
+        autospec=True,
+        side_effect=RuntimeError("unexpected tensor all"),
+    ):
+        result = stack(msa, pair)
+
+    assert torch.equal(result, msa)
+
+
+def test_assert_msa_padding_roundtrip_detects_mismatched_real_rows() -> None:
+    original = torch.ones(2, 3, 5, 4)
+    padded = torch.zeros(2, 6, 5, 4)
+
+    try:
+        _assert_msa_padding_roundtrip(padded, original)
+    except AssertionError as exc:
+        assert "MSA padding roundtrip" in str(exc)
+    else:
+        raise AssertionError("expected MSA padding roundtrip check to fail")
